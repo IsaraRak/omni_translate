@@ -85,23 +85,7 @@ def normalize_lang(code):
     if code in ("zh-tw", "zh-hant"):
         return "zh-TW"
     return code.split("-")[0]
-def detect_language_api(text):
-    if not text:
-        return "auto"
-    try:
-        encoded_text = urllib.parse.quote(text[:250])
-        url = f"https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=en&dt=t&ie=UTF-8&oe=UTF-8&q={encoded_text}"
-        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'})
-        with urllib.request.urlopen(req, timeout=5) as response:
-            data = json.loads(response.read().decode('utf-8'))
-            if len(data) > 2 and data[2]:
-                return data[2]
-            if len(data) > 8 and data[8] and len(data[8]) > 0 and len(data[8][0]) > 0:
-                return data[8][0][0]
-    except Exception:
-        pass
-    return "auto"
-def fetch_translation_api(text, sl, tl):
+def query_google_api(text, sl, tl):
     encoded_text = urllib.parse.quote(text)
     url = f"https://translate.googleapis.com/translate_a/single?client=gtx&sl={sl}&tl={tl}&dt=t&ie=UTF-8&oe=UTF-8&q={encoded_text}"
     req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'})
@@ -109,9 +93,13 @@ def fetch_translation_api(text, sl, tl):
         raw_data = response.read().decode('utf-8')
         data = json.loads(raw_data)
         translated_text = "".join([part[0] for part in data[0] if part and part[0]])
-        detected_src = data[2] if len(data) > 2 and data[2] else sl
+        detected_src = ""
+        if len(data) > 2 and data[2]:
+            detected_src = data[2]
+        elif len(data) > 8 and data[8] and len(data[8]) > 0 and len(data[8][0]) > 0:
+            detected_src = data[8][0][0]
         return translated_text, detected_src
-def fetch_translation_web(text, sl, tl):
+def query_google_web(text, sl, tl):
     encoded_text = urllib.parse.quote(text)
     url = f"https://translate.google.com/m?sl={sl}&tl={tl}&hl=en&q={encoded_text}"
     req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'})
@@ -120,45 +108,38 @@ def fetch_translation_web(text, sl, tl):
         import re
         match = re.search(r'<div class="result-container">(.*?)</div>', html_content, re.DOTALL)
         if match:
-            translated_text = html.unescape(match.group(1).strip())
-            return translated_text, sl
-        raise Exception("Web parsing failed")
+            return html.unescape(match.group(1).strip()), sl
+        raise Exception("Web fallback failed")
 def execute_translation(text, sl, tl):
     cfg = load_config()
     target_lang = tl
     secondary_lang = cfg.get("sourceLang", "en")
     is_auto = cfg.get("autoDetect", True)
-    detected_lang = sl
-    final_target = target_lang
-    if is_auto or sl == "auto":
-        detected_lang = detect_language_api(text)
-        norm_det = normalize_lang(detected_lang)
+    src_query = "auto" if is_auto else sl
+    try:
+        # Step 1: Query API targeting Primary Target first
+        trans_res, detected_src = query_google_api(text, src_query, target_lang)
+        norm_det = normalize_lang(detected_src)
         norm_tgt = normalize_lang(target_lang)
         norm_sec = normalize_lang(secondary_lang)
-        if norm_tgt != norm_sec:
-            if norm_det and norm_det == norm_tgt:
-                final_target = secondary_lang
-            elif norm_det and norm_det == norm_sec:
-                final_target = target_lang
-            else:
-                final_target = target_lang
-    source_for_api = detected_lang if (detected_lang and detected_lang != "auto") else "auto"
-    try:
-        translated_text, actual_detected = fetch_translation_api(text, source_for_api, final_target)
-        # Fallback: if translated text is identical and we targeted primary, try secondary
-        if translated_text.strip().lower() == text.strip().lower() and final_target == target_lang and target_lang != secondary_lang:
-            alt_text, alt_det = fetch_translation_api(text, "auto", secondary_lang)
-            if alt_text.strip().lower() != text.strip().lower():
-                return alt_text, (alt_det or detected_lang), secondary_lang
-        final_src = actual_detected if actual_detected and actual_detected != "auto" else detected_lang
-        return translated_text, final_src, final_target
+        # Step 2: Check if detected input is already the Primary Target language
+        # If input == Primary Target, we must translate to Secondary Swap language
+        if is_auto and norm_tgt != norm_sec:
+            if norm_det == norm_tgt or (trans_res.strip().lower() == text.strip().lower() and len(text.strip()) > 1):
+                swap_res, swap_det = query_google_api(text, "auto", secondary_lang)
+                return swap_res, (swap_det or detected_src or target_lang), secondary_lang
+        return trans_res, (detected_src or "auto"), target_lang
     except Exception:
         pass
+    # Web Fallback Engine
     try:
-        translated_text, _ = fetch_translation_web(text, source_for_api, final_target)
-        return translated_text, detected_lang, final_target
+        trans_res, det = query_google_web(text, src_query, target_lang)
+        if is_auto and target_lang != secondary_lang and trans_res.strip().lower() == text.strip().lower() and len(text.strip()) > 1:
+            swap_res, _ = query_google_web(text, "auto", secondary_lang)
+            return swap_res, target_lang, secondary_lang
+        return trans_res, det, target_lang
     except Exception as e:
-        raise Exception(f"Translation engines unavailable: {str(e)}")
+        raise Exception(f"Translation service unavailable: {str(e)}")
 class ResultViewerDialog(gui.SettingsDialog):
     title = "OmniTranslate - Translation Result"
     def __init__(self, parent, result_text):
