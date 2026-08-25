@@ -7,7 +7,6 @@ import textInfos
 import threading
 import json
 import os
-import re
 import urllib.request
 import urllib.parse
 import html
@@ -88,21 +87,9 @@ def normalize_lang(code):
     return code.split("-")[0]
 def detect_language_api(text):
     if not text:
-        return ""
-    if re.search(r'[\u0e01-\u0e5b]', text):
-        return "th"
-    if re.search(r'[\u3040-\u30ff\u31f0-\u31ff]', text):
-        return "ja"
-    if re.search(r'[\uac00-\ud7af\u1100-\u11ff]', text):
-        return "ko"
-    if re.search(r'[\u4e00-\u9fff]', text):
-        return "zh-CN"
-    if re.search(r'[\u0600-\u06ff]', text):
-        return "ar"
-    if re.search(r'[\u0400-\u04ff]', text):
-        return "ru"
+        return "auto"
     try:
-        encoded_text = urllib.parse.quote(text[:200])
+        encoded_text = urllib.parse.quote(text[:250])
         url = f"https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=en&dt=t&ie=UTF-8&oe=UTF-8&q={encoded_text}"
         req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'})
         with urllib.request.urlopen(req, timeout=5) as response:
@@ -113,8 +100,6 @@ def detect_language_api(text):
                 return data[8][0][0]
     except Exception:
         pass
-    if re.search(r'[a-zA-Z]', text):
-        return "en"
     return "auto"
 def fetch_translation_api(text, sl, tl):
     encoded_text = urllib.parse.quote(text)
@@ -132,6 +117,7 @@ def fetch_translation_web(text, sl, tl):
     req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'})
     with urllib.request.urlopen(req, timeout=10) as response:
         html_content = response.read().decode('utf-8', errors='ignore')
+        import re
         match = re.search(r'<div class="result-container">(.*?)</div>', html_content, re.DOTALL)
         if match:
             translated_text = html.unescape(match.group(1).strip())
@@ -150,19 +136,26 @@ def execute_translation(text, sl, tl):
         norm_tgt = normalize_lang(target_lang)
         norm_sec = normalize_lang(secondary_lang)
         if norm_tgt != norm_sec:
-            if norm_det == norm_tgt:
+            if norm_det and norm_det == norm_tgt:
                 final_target = secondary_lang
-            elif norm_det == norm_sec:
+            elif norm_det and norm_det == norm_sec:
                 final_target = target_lang
             else:
                 final_target = target_lang
+    source_for_api = detected_lang if (detected_lang and detected_lang != "auto") else "auto"
     try:
-        translated_text, _ = fetch_translation_api(text, detected_lang if detected_lang != "auto" else "auto", final_target)
-        return translated_text, detected_lang, final_target
+        translated_text, actual_detected = fetch_translation_api(text, source_for_api, final_target)
+        # Fallback: if translated text is identical and we targeted primary, try secondary
+        if translated_text.strip().lower() == text.strip().lower() and final_target == target_lang and target_lang != secondary_lang:
+            alt_text, alt_det = fetch_translation_api(text, "auto", secondary_lang)
+            if alt_text.strip().lower() != text.strip().lower():
+                return alt_text, (alt_det or detected_lang), secondary_lang
+        final_src = actual_detected if actual_detected and actual_detected != "auto" else detected_lang
+        return translated_text, final_src, final_target
     except Exception:
         pass
     try:
-        translated_text, _ = fetch_translation_web(text, detected_lang if detected_lang != "auto" else "auto", final_target)
+        translated_text, _ = fetch_translation_web(text, source_for_api, final_target)
         return translated_text, detected_lang, final_target
     except Exception as e:
         raise Exception(f"Translation engines unavailable: {str(e)}")
