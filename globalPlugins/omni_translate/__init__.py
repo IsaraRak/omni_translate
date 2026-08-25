@@ -7,7 +7,6 @@ import textInfos
 import threading
 import json
 import os
-import re
 import urllib.request
 import urllib.parse
 import html
@@ -15,7 +14,6 @@ import wx
 import gui
 from . import docHandler
 CONFIG_FILE = os.path.join(os.path.dirname(__file__), "omni_translate_config.json")
-# เก็บประวัติและข้อความล่าสุดใน RAM Session ชั่วคราว (ถูกล้างทิ้งเมื่อรีสตาร์ท NVDA)
 SESSION_HISTORY = []
 LAST_TRANSLATION = ""
 AVAILABLE_LANGUAGES = {
@@ -82,42 +80,11 @@ def normalize_lang(code):
         return ""
     code = code.lower().strip()
     if code in ("zh-cn", "zh-hans", "zh"):
-        return "zh-CN"
+        return "zh-cn"
     if code in ("zh-tw", "zh-hant"):
-        return "zh-TW"
+        return "zh-tw"
     return code.split("-")[0]
-def detect_language(text):
-    if not text or not text.strip():
-        return "auto"
-    # 1. ตรวจสอบชุดอักขระเด่นชัดสากลเบื้องต้น
-    if re.search(r'[\u0e01-\u0e5b]', text):
-        return "th"
-    if re.search(r'[\u3040-\u30ff\u31f0-\u31ff]', text):
-        return "ja"
-    if re.search(r'[\uac00-\ud7af\u1100-\u11ff]', text):
-        return "ko"
-    if re.search(r'[\u4e00-\u9fff]', text):
-        return "zh-CN"
-    if re.search(r'[\u0600-\u06ff]', text):
-        return "ar"
-    if re.search(r'[\u0400-\u04ff]', text):
-        return "ru"
-    # 2. ตรวจสอบผ่าน Google API ด้วยข้อความทดสอบ
-    try:
-        sample = text.strip()[:200]
-        encoded = urllib.parse.quote(sample)
-        url = f"https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=en&dt=t&ie=UTF-8&oe=UTF-8&q={encoded}"
-        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'})
-        with urllib.request.urlopen(req, timeout=5) as response:
-            data = json.loads(response.read().decode('utf-8'))
-            if len(data) > 2 and data[2]:
-                return data[2]
-            if len(data) > 8 and data[8] and len(data[8]) > 0 and len(data[8][0]) > 0:
-                return data[8][0][0]
-    except Exception:
-        pass
-    return "auto"
-def fetch_translation_api(text, sl, tl):
+def request_api(text, sl, tl):
     encoded_text = urllib.parse.quote(text)
     url = f"https://translate.googleapis.com/translate_a/single?client=gtx&sl={sl}&tl={tl}&dt=t&ie=UTF-8&oe=UTF-8&q={encoded_text}"
     req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'})
@@ -127,52 +94,24 @@ def fetch_translation_api(text, sl, tl):
         translated_text = "".join([part[0] for part in data[0] if part and part[0]])
         detected_src = data[2] if len(data) > 2 and data[2] else sl
         return translated_text, detected_src
-def fetch_translation_web(text, sl, tl):
-    encoded_text = urllib.parse.quote(text)
-    url = f"https://translate.google.com/m?sl={sl}&tl={tl}&hl=en&q={encoded_text}"
-    req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'})
-    with urllib.request.urlopen(req, timeout=10) as response:
-        html_content = response.read().decode('utf-8', errors='ignore')
-        match = re.search(r'<div class="result-container">(.*?)</div>', html_content, re.DOTALL)
-        if match:
-            return html.unescape(match.group(1).strip()), sl
-        raise Exception("Web fallback engine failed")
 def execute_translation(text, sl, tl):
     cfg = load_config()
     primary_target = tl
     secondary_lang = cfg.get("sourceLang", "en")
     is_auto = cfg.get("autoDetect", True)
-    detected_src = sl
-    final_destination = primary_target
-    if is_auto or sl == "auto":
-        detected_src = detect_language(text)
+    src_query = "auto" if is_auto else sl
+    # ยิงแปลรอบแรกไปยัง Primary Target เสมอ
+    translated_text, detected_src = request_api(text, src_query, primary_target)
+    # ตรรกะ Smart Bidirectional Translation:
+    # ถ้าเปิด Auto Detect และภาษาต้นทางที่ตรวจพบ == Primary Target (หรือผลแปลออกมาเหมือนเดิมเป๊ะ)
+    if is_auto and primary_target != secondary_lang:
         norm_det = normalize_lang(detected_src)
-        norm_primary = normalize_lang(primary_target)
-        norm_secondary = normalize_lang(secondary_lang)
-        # เงื่อนไขที่ 1: ข้อความเป็นภาษาเป้าหมายหลัก -> แปลไปเป็นภาษาอันดับสอง
-        if norm_det and norm_det == norm_primary:
-            final_destination = secondary_lang
-        # เงื่อนไขที่ 2 และ 3: ข้อความเป็นภาษาอันดับสอง หรือ ภาษาที่สาม/อื่นๆ -> แปลไปเป็นภาษาเป้าหมายหลัก
-        else:
-            final_destination = primary_target
-    src_param = detected_src if (detected_src and detected_src != "auto") else "auto"
-    try:
-        translated_text, actual_detected = fetch_translation_api(text, src_param, final_destination)
-        # กรณี Fallback หากแปลตรงภาษาเดิมแล้วข้อความไม่เปลี่ยน ให้ลองสลับคู่ภาษา
-        if is_auto and primary_target != secondary_lang and translated_text.strip().lower() == text.strip().lower() and len(text.strip()) > 1:
-            alt_target = secondary_lang if final_destination == primary_target else primary_target
-            alt_text, alt_det = fetch_translation_api(text, "auto", alt_target)
-            if alt_text.strip().lower() != text.strip().lower():
-                return alt_text, (alt_det or detected_src), alt_target
-        final_src = actual_detected if (actual_detected and actual_detected != "auto") else detected_src
-        return translated_text, final_src, final_destination
-    except Exception:
-        pass
-    try:
-        translated_text, _ = fetch_translation_web(text, src_param, final_destination)
-        return translated_text, detected_src, final_destination
-    except Exception as e:
-        raise Exception(f"Translation engines unavailable: {str(e)}")
+        norm_pri = normalize_lang(primary_target)
+        if norm_det == norm_pri or translated_text.strip().lower() == text.strip().lower():
+            # สลับแปลไปเป็น Secondary Swap ทันที
+            translated_text, swap_detected = request_api(text, "auto", secondary_lang)
+            return translated_text, (swap_detected or detected_src or primary_target), secondary_lang
+    return translated_text, detected_src, primary_target
 class ResultViewerDialog(gui.SettingsDialog):
     title = "OmniTranslate - Translation Result"
     def __init__(self, parent, result_text):
@@ -248,7 +187,7 @@ class SettingsDialog(gui.SettingsDialog):
             ctrl = sHelper.addLabeledControl(f"Quick Cycle Slot {i}:", wx.Choice, choices=tgt_choices)
             ctrl.SetSelection(s_idx)
             self.slotControls.append(ctrl)
-        # 4. Checkboxes (ด้านล่างสุด)
+        # 4. Checkboxes
         self.autoDetectCheck = sHelper.addItem(wx.CheckBox(self, label="Auto-detect input language"))
         self.autoDetectCheck.SetValue(self.cfg.get("autoDetect", True))
         self.copyCheck = sHelper.addItem(wx.CheckBox(self, label="Automatically copy translation to clipboard"))
