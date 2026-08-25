@@ -7,6 +7,7 @@ import textInfos
 import threading
 import json
 import os
+import re
 import urllib.request
 import urllib.parse
 import html
@@ -84,33 +85,63 @@ def normalize_lang(code):
     if code in ("zh-tw", "zh-hant"):
         return "zh-tw"
     return code.split("-")[0]
-def request_api(text, sl, tl):
+def get_headers():
+    return {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/json,*/*',
+        'Accept-Language': 'en-US,en;q=0.9,th;q=0.8',
+        'Referer': 'https://translate.google.com/'
+    }
+def request_api_endpoint(text, sl, tl, client_type="gtx"):
     encoded_text = urllib.parse.quote(text)
-    url = f"https://translate.googleapis.com/translate_a/single?client=gtx&sl={sl}&tl={tl}&dt=t&ie=UTF-8&oe=UTF-8&q={encoded_text}"
-    req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'})
-    with urllib.request.urlopen(req, timeout=10) as response:
+    url = f"https://translate.googleapis.com/translate_a/single?client={client_type}&sl={sl}&tl={tl}&dt=t&ie=UTF-8&oe=UTF-8&q={encoded_text}"
+    req = urllib.request.Request(url, headers=get_headers())
+    with urllib.request.urlopen(req, timeout=8) as response:
         raw_data = response.read().decode('utf-8')
         data = json.loads(raw_data)
         translated_text = "".join([part[0] for part in data[0] if part and part[0]])
         detected_src = data[2] if len(data) > 2 and data[2] else sl
         return translated_text, detected_src
+def request_web_fallback(text, sl, tl):
+    encoded_text = urllib.parse.quote(text)
+    url = f"https://translate.google.com/m?sl={sl}&tl={tl}&hl=en&q={encoded_text}"
+    req = urllib.request.Request(url, headers=get_headers())
+    with urllib.request.urlopen(req, timeout=10) as response:
+        html_content = response.read().decode('utf-8', errors='ignore')
+        match = re.search(r'<div class="result-container">(.*?)</div>', html_content, re.DOTALL)
+        if match:
+            translated_text = html.unescape(match.group(1).strip())
+            return translated_text, sl
+        raise Exception("Unable to extract translation from Web Engine")
+def translate_query(text, sl, tl):
+    # ลอง API gtx
+    try:
+        return request_api_endpoint(text, sl, tl, "gtx")
+    except Exception:
+        pass
+    # ลอง API dict-chrome-ex สำรอง
+    try:
+        return request_api_endpoint(text, sl, tl, "dict-chrome-ex")
+    except Exception:
+        pass
+    # ถ้าติด Rate Limit 429 ให้สลับไป Web Engine ทันที
+    return request_web_fallback(text, sl, tl)
 def execute_translation(text, sl, tl):
     cfg = load_config()
     primary_target = tl
     secondary_lang = cfg.get("sourceLang", "en")
     is_auto = cfg.get("autoDetect", True)
     src_query = "auto" if is_auto else sl
-    # ยิงแปลรอบแรกไปยัง Primary Target เสมอ
-    translated_text, detected_src = request_api(text, src_query, primary_target)
-    # ตรรกะ Smart Bidirectional Translation:
-    # ถ้าเปิด Auto Detect และภาษาต้นทางที่ตรวจพบ == Primary Target (หรือผลแปลออกมาเหมือนเดิมเป๊ะ)
+    # 1. ยิงแปลไปยัง Primary Target เป็นค่าเริ่มต้น
+    translated_text, detected_src = translate_query(text, src_query, primary_target)
+    # 2. ตรวจสอบตรรกะ Smart Routing
     if is_auto and primary_target != secondary_lang:
         norm_det = normalize_lang(detected_src)
         norm_pri = normalize_lang(primary_target)
+        # หากภาษาต้นทางคือ Primary Target หรือข้อความแปลออกมาแล้วเหมือนต้นฉบับเป๊ะ
         if norm_det == norm_pri or translated_text.strip().lower() == text.strip().lower():
-            # สลับแปลไปเป็น Secondary Swap ทันที
-            translated_text, swap_detected = request_api(text, "auto", secondary_lang)
-            return translated_text, (swap_detected or detected_src or primary_target), secondary_lang
+            swap_text, swap_detected = translate_query(text, "auto", secondary_lang)
+            return swap_text, (swap_detected or detected_src or primary_target), secondary_lang
     return translated_text, detected_src, primary_target
 class ResultViewerDialog(gui.SettingsDialog):
     title = "OmniTranslate - Translation Result"
