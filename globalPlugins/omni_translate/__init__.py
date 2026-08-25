@@ -86,6 +86,45 @@ def save_history(entry):
             json.dump(history, f, ensure_ascii=False, indent=2)
     except Exception:
         pass
+def normalize_lang(code):
+    if not code:
+        return ""
+    code = code.lower().strip()
+    if code in ("zh-cn", "zh-hans", "zh"):
+        return "zh-CN"
+    if code in ("zh-tw", "zh-hant"):
+        return "zh-TW"
+    return code.split("-")[0]
+def detect_language_api(text):
+    if not text:
+        return ""
+    if re.search(r'[\u0e01-\u0e5b]', text):
+        return "th"
+    if re.search(r'[\u3040-\u30ff\u31f0-\u31ff]', text):
+        return "ja"
+    if re.search(r'[\uac00-\ud7af\u1100-\u11ff]', text):
+        return "ko"
+    if re.search(r'[\u4e00-\u9fff]', text):
+        return "zh-CN"
+    if re.search(r'[\u0600-\u06ff]', text):
+        return "ar"
+    if re.search(r'[\u0400-\u04ff]', text):
+        return "ru"
+    try:
+        encoded_text = urllib.parse.quote(text[:200])
+        url = f"https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=en&dt=t&ie=UTF-8&oe=UTF-8&q={encoded_text}"
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'})
+        with urllib.request.urlopen(req, timeout=5) as response:
+            data = json.loads(response.read().decode('utf-8'))
+            if len(data) > 2 and data[2]:
+                return data[2]
+            if len(data) > 8 and data[8] and len(data[8]) > 0 and len(data[8][0]) > 0:
+                return data[8][0][0]
+    except Exception:
+        pass
+    if re.search(r'[a-zA-Z]', text):
+        return "en"
+    return "auto"
 def fetch_translation_api(text, sl, tl):
     encoded_text = urllib.parse.quote(text)
     url = f"https://translate.googleapis.com/translate_a/single?client=gtx&sl={sl}&tl={tl}&dt=t&ie=UTF-8&oe=UTF-8&q={encoded_text}"
@@ -108,22 +147,32 @@ def fetch_translation_web(text, sl, tl):
             return translated_text, sl
         raise Exception("Web parsing failed")
 def execute_translation(text, sl, tl):
+    cfg = load_config()
+    target_lang = tl
+    secondary_lang = cfg.get("sourceLang", "en")
+    is_auto = cfg.get("autoDetect", True)
+    detected_lang = sl
+    final_target = target_lang
+    if is_auto or sl == "auto":
+        detected_lang = detect_language_api(text)
+        norm_det = normalize_lang(detected_lang)
+        norm_tgt = normalize_lang(target_lang)
+        norm_sec = normalize_lang(secondary_lang)
+        if norm_tgt != norm_sec:
+            if norm_det == norm_tgt:
+                final_target = secondary_lang
+            elif norm_det == norm_sec:
+                final_target = target_lang
+            else:
+                final_target = target_lang
     try:
-        translated_text, detected_lang = fetch_translation_api(text, sl, tl)
-        cfg = load_config()
-        secondary_lang = cfg.get("sourceLang", "en")
-        # Smart Dual-Language Routing:
-        # If detected language matches primary target, and primary target differs from secondary,
-        # automatically re-route translation to the secondary language.
-        if detected_lang == tl and secondary_lang != tl:
-            translated_text, _ = fetch_translation_api(text, detected_lang, secondary_lang)
-            return translated_text, detected_lang, secondary_lang
-        return translated_text, detected_lang, tl
+        translated_text, _ = fetch_translation_api(text, detected_lang if detected_lang != "auto" else "auto", final_target)
+        return translated_text, detected_lang, final_target
     except Exception:
         pass
     try:
-        translated_text, detected_lang = fetch_translation_web(text, sl, tl)
-        return translated_text, detected_lang, tl
+        translated_text, _ = fetch_translation_web(text, detected_lang if detected_lang != "auto" else "auto", final_target)
+        return translated_text, detected_lang, final_target
     except Exception as e:
         raise Exception(f"Translation engines unavailable: {str(e)}")
 class ResultViewerDialog(gui.SettingsDialog):
@@ -178,24 +227,21 @@ class SettingsDialog(gui.SettingsDialog):
         self.cfg = load_config()
         self.lang_keys = list(AVAILABLE_LANGUAGES.keys())
         self.lang_names = list(AVAILABLE_LANGUAGES.values())
-        src_choices = [AVAILABLE_LANGUAGES[k] for k in self.lang_keys if k != "auto"]
-        src_keys = [k for k in self.lang_keys if k != "auto"]
-        src_idx = src_keys.index(self.cfg.get("sourceLang", "en")) if self.cfg.get("sourceLang", "en") in src_keys else 0
-        self.srcChoice = sHelper.addLabeledControl("Secondary / Source language:", wx.Choice, choices=src_choices)
-        self.srcChoice.SetSelection(src_idx)
-        self.src_keys = src_keys
+        # 1. Primary target language
         tgt_choices = [AVAILABLE_LANGUAGES[k] for k in self.lang_keys if k != "auto"]
         tgt_keys = [k for k in self.lang_keys if k != "auto"]
         tgt_idx = tgt_keys.index(self.cfg.get("targetLang", "th")) if self.cfg.get("targetLang", "th") in tgt_keys else 0
-        self.tgtChoice = sHelper.addLabeledControl("Primary Target language:", wx.Choice, choices=tgt_choices)
+        self.tgtChoice = sHelper.addLabeledControl("Primary target language:", wx.Choice, choices=tgt_choices)
         self.tgtChoice.SetSelection(tgt_idx)
         self.tgt_keys = tgt_keys
-        self.autoDetectCheck = sHelper.addItem(wx.CheckBox(self, label="Auto-detect source language"))
-        self.autoDetectCheck.SetValue(self.cfg.get("autoDetect", True))
-        self.copyCheck = sHelper.addItem(wx.CheckBox(self, label="Automatically copy translation to clipboard"))
-        self.copyCheck.SetValue(self.cfg.get("copyToClipboard", False))
-        self.speakCheck = sHelper.addItem(wx.CheckBox(self, label="Speak translation automatically"))
-        self.speakCheck.SetValue(self.cfg.get("speakResult", True))
+        # 2. Secondary swap language
+        src_choices = [AVAILABLE_LANGUAGES[k] for k in self.lang_keys if k != "auto"]
+        src_keys = [k for k in self.lang_keys if k != "auto"]
+        src_idx = src_keys.index(self.cfg.get("sourceLang", "en")) if self.cfg.get("sourceLang", "en") in src_keys else 0
+        self.srcChoice = sHelper.addLabeledControl("Secondary swap language:", wx.Choice, choices=src_choices)
+        self.srcChoice.SetSelection(src_idx)
+        self.src_keys = src_keys
+        # 3. Quick Cycle Slots 1 - 5
         self.slotControls = []
         for i in range(1, 6):
             slot_key = f"quickSlot{i}"
@@ -204,14 +250,21 @@ class SettingsDialog(gui.SettingsDialog):
             ctrl = sHelper.addLabeledControl(f"Quick Cycle Slot {i}:", wx.Choice, choices=tgt_choices)
             ctrl.SetSelection(s_idx)
             self.slotControls.append(ctrl)
+        # 4. Checkboxes at the bottom
+        self.autoDetectCheck = sHelper.addItem(wx.CheckBox(self, label="Auto-detect input language"))
+        self.autoDetectCheck.SetValue(self.cfg.get("autoDetect", True))
+        self.copyCheck = sHelper.addItem(wx.CheckBox(self, label="Automatically copy translation to clipboard"))
+        self.copyCheck.SetValue(self.cfg.get("copyToClipboard", False))
+        self.speakCheck = sHelper.addItem(wx.CheckBox(self, label="Speak translation automatically"))
+        self.speakCheck.SetValue(self.cfg.get("speakResult", True))
     def onOk(self, evt):
-        self.cfg["sourceLang"] = self.src_keys[self.srcChoice.GetSelection()]
         self.cfg["targetLang"] = self.tgt_keys[self.tgtChoice.GetSelection()]
+        self.cfg["sourceLang"] = self.src_keys[self.srcChoice.GetSelection()]
+        for i, ctrl in enumerate(self.slotControls, 1):
+            self.cfg[f"quickSlot{i}"] = self.tgt_keys[ctrl.GetSelection()]
         self.cfg["autoDetect"] = self.autoDetectCheck.GetValue()
         self.cfg["copyToClipboard"] = self.copyCheck.GetValue()
         self.cfg["speakResult"] = self.speakCheck.GetValue()
-        for i, ctrl in enumerate(self.slotControls, 1):
-            self.cfg[f"quickSlot{i}"] = self.tgt_keys[ctrl.GetSelection()]
         save_config(self.cfg)
         super(SettingsDialog, self).onOk(evt)
 class GlobalPlugin(globalPluginHandler.GlobalPlugin):
