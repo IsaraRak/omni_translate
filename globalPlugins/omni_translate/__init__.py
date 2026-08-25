@@ -15,7 +15,9 @@ import wx
 import gui
 from . import docHandler
 CONFIG_FILE = os.path.join(os.path.dirname(__file__), "omni_translate_config.json")
-HISTORY_FILE = os.path.join(os.path.dirname(__file__), "omni_translate_history.json")
+# In-memory session history and last translated text (Cleared on NVDA restart)
+SESSION_HISTORY = []
+LAST_TRANSLATION = ""
 AVAILABLE_LANGUAGES = {
     "auto": "Auto Detect", "af": "Afrikaans", "sq": "Albanian", "am": "Amharic", "ar": "Arabic",
     "hy": "Armenian", "az": "Azerbaijani", "eu": "Basque", "be": "Belarusian", "bn": "Bengali",
@@ -69,23 +71,12 @@ def save_config(cfg):
             json.dump(cfg, f, ensure_ascii=False, indent=2)
     except Exception:
         pass
-def load_history():
-    if os.path.exists(HISTORY_FILE):
-        try:
-            with open(HISTORY_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return []
-def save_history(entry):
-    try:
-        history = load_history()
-        history.insert(0, entry)
-        history = history[:10]
-        with open(HISTORY_FILE, "w", encoding="utf-8") as f:
-            json.dump(history, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
+def add_session_history(entry):
+    global SESSION_HISTORY
+    SESSION_HISTORY.insert(0, entry)
+    SESSION_HISTORY = SESSION_HISTORY[:10]
+def get_session_history():
+    return SESSION_HISTORY
 def normalize_lang(code):
     if not code:
         return ""
@@ -198,10 +189,10 @@ class HistoryDialog(gui.SettingsDialog):
     title = "OmniTranslate - History"
     def makeSettings(self, settingsSizer):
         sHelper = gui.guiHelper.BoxSizerHelper(self, sizer=settingsSizer)
-        self.history = load_history()
+        self.history = get_session_history()
         choices = [f"[{h.get('from','?') }->{h.get('to','?')}] {h.get('original','')[:25]}... -> {h.get('translated','')[:25]}..." for h in self.history]
         if not choices:
-            choices = ["No translation history available."]
+            choices = ["No translation history available for this session."]
         self.historyList = sHelper.addLabeledControl("Recent Translations (10 max):", wx.ListBox, choices=choices)
         self.historyList.SetSelection(0)
         self.historyList.SetFocus()
@@ -250,7 +241,7 @@ class SettingsDialog(gui.SettingsDialog):
             ctrl = sHelper.addLabeledControl(f"Quick Cycle Slot {i}:", wx.Choice, choices=tgt_choices)
             ctrl.SetSelection(s_idx)
             self.slotControls.append(ctrl)
-        # 4. Checkboxes at the bottom
+        # 4. Checkboxes
         self.autoDetectCheck = sHelper.addItem(wx.CheckBox(self, label="Auto-detect input language"))
         self.autoDetectCheck.SetValue(self.cfg.get("autoDetect", True))
         self.copyCheck = sHelper.addItem(wx.CheckBox(self, label="Automatically copy translation to clipboard"))
@@ -271,7 +262,6 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
     scriptCategory = "OmniTranslate"
     def __init__(self):
         super(GlobalPlugin, self).__init__()
-        self.last_translated_text = ""
         self.current_slot_index = 0
         self.settings_item = None
         self.help_item = None
@@ -331,16 +321,17 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             pass
         return None
     def _async_translate(self, text, sl, tl):
+        global LAST_TRANSLATION
         try:
             ui.message("Translating...")
             result, actual_src, actual_tgt = execute_translation(text, sl, tl)
-            self.last_translated_text = result
+            LAST_TRANSLATION = result
             cfg = load_config()
             if cfg.get("copyToClipboard", False):
                 api.copyToClip(result)
             if cfg.get("speakResult", True):
                 ui.message(result)
-            save_history({
+            add_session_history({
                 "original": text,
                 "translated": result,
                 "from": actual_src,
@@ -380,11 +371,12 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         ui.message(f"Target: Slot {self.current_slot_index + 1} ({lang_name})")
     script_quickSwitch.__doc__ = "Cycles through 5 configured quick-switch target language slots."
     def script_openViewer(self, gesture):
-        if not self.last_translated_text:
+        global LAST_TRANSLATION
+        if not LAST_TRANSLATION:
             ui.message("No translation available to view.")
             return
         gui.mainFrame.prePopup()
-        d = ResultViewerDialog(gui.mainFrame, self.last_translated_text)
+        d = ResultViewerDialog(gui.mainFrame, LAST_TRANSLATION)
         d.Show()
         gui.mainFrame.postPopup()
     script_openViewer.__doc__ = "Opens accessible Result Viewer dialog."
@@ -402,14 +394,16 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         ui.message(f"Speech output {state}")
     script_toggleSpeech.__doc__ = "Toggles automatic speech output."
     def script_repeatLast(self, gesture):
-        if self.last_translated_text:
-            ui.message(self.last_translated_text)
+        global LAST_TRANSLATION
+        if LAST_TRANSLATION:
+            ui.message(LAST_TRANSLATION)
         else:
             ui.message("No recent translation.")
     script_repeatLast.__doc__ = "Repeats the last translated result."
     def script_copyLast(self, gesture):
-        if self.last_translated_text:
-            if api.copyToClip(self.last_translated_text):
+        global LAST_TRANSLATION
+        if LAST_TRANSLATION:
+            if api.copyToClip(LAST_TRANSLATION):
                 ui.message("Last result copied to clipboard.")
         else:
             ui.message("No recent translation.")
