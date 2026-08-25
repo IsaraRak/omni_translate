@@ -15,6 +15,11 @@ import wx
 import gui
 from . import docHandler
 CONFIG_FILE = os.path.join(os.path.dirname(__file__), "omni_translate_config.json")
+# In-memory session state (Cleared on NVDA restart)
+SESSION_MEMORY = {
+    "last_text": "",
+    "history": []
+}
 AVAILABLE_LANGUAGES = {
     "auto": "Auto Detect", "af": "Afrikaans", "sq": "Albanian", "am": "Amharic", "ar": "Arabic",
     "hy": "Armenian", "az": "Azerbaijani", "eu": "Basque", "be": "Belarusian", "bn": "Bengali",
@@ -102,8 +107,7 @@ def request_web_fallback(text, sl, tl):
         html_content = response.read().decode('utf-8', errors='ignore')
         match = re.search(r'<div class="result-container">(.*?)</div>', html_content, re.DOTALL)
         if match:
-            translated_text = html.unescape(match.group(1).strip())
-            return translated_text, sl
+            return html.unescape(match.group(1).strip()), sl
         raise Exception("Unable to extract translation from Web Engine")
 def translate_query(text, sl, tl):
     try:
@@ -228,8 +232,6 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
     def __init__(self):
         super(GlobalPlugin, self).__init__()
         self.current_slot_index = 0
-        self.last_translation = ""
-        self.session_history = []
         self.settings_item = None
         self.help_item = None
         if hasattr(gui, "mainFrame") and hasattr(gui.mainFrame, "sysTrayIcon"):
@@ -291,14 +293,15 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         try:
             ui.message("Translating...")
             result, actual_src, actual_tgt = execute_translation(text, sl, tl)
-            self.last_translation = result
-            self.session_history.insert(0, {
+            # บันทึกลง Memory ส่วนกลางทันที
+            SESSION_MEMORY["last_text"] = result
+            SESSION_MEMORY["history"].insert(0, {
                 "original": text,
                 "translated": result,
                 "from": actual_src,
                 "to": actual_tgt
             })
-            self.session_history = self.session_history[:10]
+            SESSION_MEMORY["history"] = SESSION_MEMORY["history"][:10]
             cfg = load_config()
             if cfg.get("copyToClipboard", False):
                 api.copyToClip(result)
@@ -338,17 +341,18 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         ui.message(f"Target: Slot {self.current_slot_index + 1} ({lang_name})")
     script_quickSwitch.__doc__ = "Cycles through 5 configured quick-switch target language slots."
     def script_openViewer(self, gesture):
-        if not self.last_translation:
+        target_text = SESSION_MEMORY.get("last_text", "")
+        if not target_text:
             ui.message("No translation available to view.")
             return
         gui.mainFrame.prePopup()
-        d = ResultViewerDialog(gui.mainFrame, self.last_translation)
+        d = ResultViewerDialog(gui.mainFrame, target_text)
         d.Show()
         gui.mainFrame.postPopup()
     script_openViewer.__doc__ = "Opens accessible Result Viewer dialog."
     def script_openHistory(self, gesture):
         gui.mainFrame.prePopup()
-        d = HistoryDialog(gui.mainFrame, self.session_history)
+        d = HistoryDialog(gui.mainFrame, SESSION_MEMORY["history"])
         d.Show()
         gui.mainFrame.postPopup()
     script_openHistory.__doc__ = "Opens translation history dialog."
@@ -360,14 +364,16 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         ui.message(f"Speech output {state}")
     script_toggleSpeech.__doc__ = "Toggles automatic speech output."
     def script_repeatLast(self, gesture):
-        if self.last_translation:
-            ui.message(self.last_translation)
+        target_text = SESSION_MEMORY.get("last_text", "")
+        if target_text:
+            ui.message(target_text)
         else:
             ui.message("No recent translation.")
     script_repeatLast.__doc__ = "Repeats the last translated result."
     def script_copyLast(self, gesture):
-        if self.last_translation:
-            if api.copyToClip(self.last_translation):
+        target_text = SESSION_MEMORY.get("last_text", "")
+        if target_text:
+            if api.copyToClip(target_text):
                 ui.message("Last result copied to clipboard.")
             else:
                 ui.message("Failed to copy to clipboard.")
@@ -388,6 +394,6 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         "kb:NVDA+shift+h": "openHistory",
         "kb:NVDA+shift+m": "toggleSpeech",
         "kb:NVDA+shift+z": "repeatLast",
-        "kb:NVDA+shift+y": "copyLast",
+        "kb:NVDA+shift+c": "copyLast",
         "kb:NVDA+shift+o": "openSettings",
     }
