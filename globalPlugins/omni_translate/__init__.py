@@ -15,8 +15,6 @@ import wx
 import gui
 from . import docHandler
 CONFIG_FILE = os.path.join(os.path.dirname(__file__), "omni_translate_config.json")
-SESSION_HISTORY = []
-LAST_TRANSLATION = ""
 AVAILABLE_LANGUAGES = {
     "auto": "Auto Detect", "af": "Afrikaans", "sq": "Albanian", "am": "Amharic", "ar": "Arabic",
     "hy": "Armenian", "az": "Azerbaijani", "eu": "Basque", "be": "Belarusian", "bn": "Bengali",
@@ -70,12 +68,6 @@ def save_config(cfg):
             json.dump(cfg, f, ensure_ascii=False, indent=2)
     except Exception:
         pass
-def add_session_history(entry):
-    global SESSION_HISTORY
-    SESSION_HISTORY.insert(0, entry)
-    SESSION_HISTORY = SESSION_HISTORY[:10]
-def get_session_history():
-    return SESSION_HISTORY
 def normalize_lang(code):
     if not code:
         return ""
@@ -114,17 +106,14 @@ def request_web_fallback(text, sl, tl):
             return translated_text, sl
         raise Exception("Unable to extract translation from Web Engine")
 def translate_query(text, sl, tl):
-    # ลอง API gtx
     try:
         return request_api_endpoint(text, sl, tl, "gtx")
     except Exception:
         pass
-    # ลอง API dict-chrome-ex สำรอง
     try:
         return request_api_endpoint(text, sl, tl, "dict-chrome-ex")
     except Exception:
         pass
-    # ถ้าติด Rate Limit 429 ให้สลับไป Web Engine ทันที
     return request_web_fallback(text, sl, tl)
 def execute_translation(text, sl, tl):
     cfg = load_config()
@@ -132,13 +121,10 @@ def execute_translation(text, sl, tl):
     secondary_lang = cfg.get("sourceLang", "en")
     is_auto = cfg.get("autoDetect", True)
     src_query = "auto" if is_auto else sl
-    # 1. ยิงแปลไปยัง Primary Target เป็นค่าเริ่มต้น
     translated_text, detected_src = translate_query(text, src_query, primary_target)
-    # 2. ตรวจสอบตรรกะ Smart Routing
     if is_auto and primary_target != secondary_lang:
         norm_det = normalize_lang(detected_src)
         norm_pri = normalize_lang(primary_target)
-        # หากภาษาต้นทางคือ Primary Target หรือข้อความแปลออกมาแล้วเหมือนต้นฉบับเป๊ะ
         if norm_det == norm_pri or translated_text.strip().lower() == text.strip().lower():
             swap_text, swap_detected = translate_query(text, "auto", secondary_lang)
             return swap_text, (swap_detected or detected_src or primary_target), secondary_lang
@@ -164,9 +150,11 @@ class ResultViewerDialog(gui.SettingsDialog):
         self.Close()
 class HistoryDialog(gui.SettingsDialog):
     title = "OmniTranslate - History"
+    def __init__(self, parent, history_list):
+        self.history = history_list
+        super(HistoryDialog, self).__init__(parent)
     def makeSettings(self, settingsSizer):
         sHelper = gui.guiHelper.BoxSizerHelper(self, sizer=settingsSizer)
-        self.history = get_session_history()
         choices = [f"[{h.get('from','?') }->{h.get('to','?')}] {h.get('original','')[:25]}... -> {h.get('translated','')[:25]}..." for h in self.history]
         if not choices:
             choices = ["No translation history available for this session."]
@@ -240,6 +228,8 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
     def __init__(self):
         super(GlobalPlugin, self).__init__()
         self.current_slot_index = 0
+        self.last_translation = ""
+        self.session_history = []
         self.settings_item = None
         self.help_item = None
         if hasattr(gui, "mainFrame") and hasattr(gui.mainFrame, "sysTrayIcon"):
@@ -298,22 +288,22 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             pass
         return None
     def _async_translate(self, text, sl, tl):
-        global LAST_TRANSLATION
         try:
             ui.message("Translating...")
             result, actual_src, actual_tgt = execute_translation(text, sl, tl)
-            LAST_TRANSLATION = result
-            cfg = load_config()
-            if cfg.get("copyToClipboard", False):
-                api.copyToClip(result)
-            if cfg.get("speakResult", True):
-                ui.message(result)
-            add_session_history({
+            self.last_translation = result
+            self.session_history.insert(0, {
                 "original": text,
                 "translated": result,
                 "from": actual_src,
                 "to": actual_tgt
             })
+            self.session_history = self.session_history[:10]
+            cfg = load_config()
+            if cfg.get("copyToClipboard", False):
+                api.copyToClip(result)
+            if cfg.get("speakResult", True):
+                ui.message(result)
         except Exception as e:
             ui.message(f"Translation Error: {str(e)}")
     def script_translate(self, gesture):
@@ -348,18 +338,17 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         ui.message(f"Target: Slot {self.current_slot_index + 1} ({lang_name})")
     script_quickSwitch.__doc__ = "Cycles through 5 configured quick-switch target language slots."
     def script_openViewer(self, gesture):
-        global LAST_TRANSLATION
-        if not LAST_TRANSLATION:
+        if not self.last_translation:
             ui.message("No translation available to view.")
             return
         gui.mainFrame.prePopup()
-        d = ResultViewerDialog(gui.mainFrame, LAST_TRANSLATION)
+        d = ResultViewerDialog(gui.mainFrame, self.last_translation)
         d.Show()
         gui.mainFrame.postPopup()
     script_openViewer.__doc__ = "Opens accessible Result Viewer dialog."
     def script_openHistory(self, gesture):
         gui.mainFrame.prePopup()
-        d = HistoryDialog(gui.mainFrame)
+        d = HistoryDialog(gui.mainFrame, self.session_history)
         d.Show()
         gui.mainFrame.postPopup()
     script_openHistory.__doc__ = "Opens translation history dialog."
@@ -371,17 +360,17 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         ui.message(f"Speech output {state}")
     script_toggleSpeech.__doc__ = "Toggles automatic speech output."
     def script_repeatLast(self, gesture):
-        global LAST_TRANSLATION
-        if LAST_TRANSLATION:
-            ui.message(LAST_TRANSLATION)
+        if self.last_translation:
+            ui.message(self.last_translation)
         else:
             ui.message("No recent translation.")
     script_repeatLast.__doc__ = "Repeats the last translated result."
     def script_copyLast(self, gesture):
-        global LAST_TRANSLATION
-        if LAST_TRANSLATION:
-            if api.copyToClip(LAST_TRANSLATION):
+        if self.last_translation:
+            if api.copyToClip(self.last_translation):
                 ui.message("Last result copied to clipboard.")
+            else:
+                ui.message("Failed to copy to clipboard.")
         else:
             ui.message("No recent translation.")
     script_copyLast.__doc__ = "Copies the last translated result to clipboard."
@@ -399,6 +388,6 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         "kb:NVDA+shift+h": "openHistory",
         "kb:NVDA+shift+m": "toggleSpeech",
         "kb:NVDA+shift+z": "repeatLast",
-        "kb:NVDA+shift+c": "copyLast",
+        "kb:NVDA+shift+y": "copyLast",
         "kb:NVDA+shift+o": "openSettings",
     }
