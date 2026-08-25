@@ -15,11 +15,8 @@ import wx
 import gui
 from . import docHandler
 CONFIG_FILE = os.path.join(os.path.dirname(__file__), "omni_translate_config.json")
-# In-memory session state (Cleared on NVDA restart)
-SESSION_MEMORY = {
-    "last_text": "",
-    "history": []
-}
+# In-memory single source of truth (Cleared on NVDA restart)
+SESSION_HISTORY = []
 AVAILABLE_LANGUAGES = {
     "auto": "Auto Detect", "af": "Afrikaans", "sq": "Albanian", "am": "Amharic", "ar": "Arabic",
     "hy": "Armenian", "az": "Azerbaijani", "eu": "Basque", "be": "Belarusian", "bn": "Bengali",
@@ -107,7 +104,8 @@ def request_web_fallback(text, sl, tl):
         html_content = response.read().decode('utf-8', errors='ignore')
         match = re.search(r'<div class="result-container">(.*?)</div>', html_content, re.DOTALL)
         if match:
-            return html.unescape(match.group(1).strip()), sl
+            translated_text = html.unescape(match.group(1).strip())
+            return translated_text, sl
         raise Exception("Unable to extract translation from Web Engine")
 def translate_query(text, sl, tl):
     try:
@@ -154,12 +152,9 @@ class ResultViewerDialog(gui.SettingsDialog):
         self.Close()
 class HistoryDialog(gui.SettingsDialog):
     title = "OmniTranslate - History"
-    def __init__(self, parent, history_list):
-        self.history = history_list
-        super(HistoryDialog, self).__init__(parent)
     def makeSettings(self, settingsSizer):
         sHelper = gui.guiHelper.BoxSizerHelper(self, sizer=settingsSizer)
-        choices = [f"[{h.get('from','?') }->{h.get('to','?')}] {h.get('original','')[:25]}... -> {h.get('translated','')[:25]}..." for h in self.history]
+        choices = [f"[{h.get('from','?') }->{h.get('to','?')}] {h.get('original','')[:25]}... -> {h.get('translated','')[:25]}..." for h in SESSION_HISTORY]
         if not choices:
             choices = ["No translation history available for this session."]
         self.historyList = sHelper.addLabeledControl("Recent Translations (10 max):", wx.ListBox, choices=choices)
@@ -172,8 +167,8 @@ class HistoryDialog(gui.SettingsDialog):
         self.ButtonSizer.Insert(0, self.viewBtn, flag=wx.RIGHT, border=5)
     def onView(self, evt):
         sel = self.historyList.GetSelection()
-        if sel != wx.NOT_FOUND and self.history:
-            entry = self.history[sel]
+        if sel != wx.NOT_FOUND and SESSION_HISTORY:
+            entry = SESSION_HISTORY[sel]
             full_text = f"Source [{entry.get('from','?')}]:\n{entry.get('original','')}\n\nTranslation [{entry.get('to','?')}]:\n{entry.get('translated','')}"
             gui.mainFrame.prePopup()
             d = ResultViewerDialog(gui.mainFrame, full_text)
@@ -290,18 +285,17 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             pass
         return None
     def _async_translate(self, text, sl, tl):
+        global SESSION_HISTORY
         try:
             ui.message("Translating...")
             result, actual_src, actual_tgt = execute_translation(text, sl, tl)
-            # บันทึกลง Memory ส่วนกลางทันที
-            SESSION_MEMORY["last_text"] = result
-            SESSION_MEMORY["history"].insert(0, {
+            SESSION_HISTORY.insert(0, {
                 "original": text,
                 "translated": result,
                 "from": actual_src,
                 "to": actual_tgt
             })
-            SESSION_MEMORY["history"] = SESSION_MEMORY["history"][:10]
+            SESSION_HISTORY = SESSION_HISTORY[:10]
             cfg = load_config()
             if cfg.get("copyToClipboard", False):
                 api.copyToClip(result)
@@ -341,18 +335,18 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         ui.message(f"Target: Slot {self.current_slot_index + 1} ({lang_name})")
     script_quickSwitch.__doc__ = "Cycles through 5 configured quick-switch target language slots."
     def script_openViewer(self, gesture):
-        target_text = SESSION_MEMORY.get("last_text", "")
-        if not target_text:
+        if not SESSION_HISTORY:
             ui.message("No translation available to view.")
             return
+        latest_text = SESSION_HISTORY[0]["translated"]
         gui.mainFrame.prePopup()
-        d = ResultViewerDialog(gui.mainFrame, target_text)
+        d = ResultViewerDialog(gui.mainFrame, latest_text)
         d.Show()
         gui.mainFrame.postPopup()
     script_openViewer.__doc__ = "Opens accessible Result Viewer dialog."
     def script_openHistory(self, gesture):
         gui.mainFrame.prePopup()
-        d = HistoryDialog(gui.mainFrame, SESSION_MEMORY["history"])
+        d = HistoryDialog(gui.mainFrame)
         d.Show()
         gui.mainFrame.postPopup()
     script_openHistory.__doc__ = "Opens translation history dialog."
@@ -364,16 +358,15 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         ui.message(f"Speech output {state}")
     script_toggleSpeech.__doc__ = "Toggles automatic speech output."
     def script_repeatLast(self, gesture):
-        target_text = SESSION_MEMORY.get("last_text", "")
-        if target_text:
-            ui.message(target_text)
+        if SESSION_HISTORY:
+            ui.message(SESSION_HISTORY[0]["translated"])
         else:
             ui.message("No recent translation.")
     script_repeatLast.__doc__ = "Repeats the last translated result."
     def script_copyLast(self, gesture):
-        target_text = SESSION_MEMORY.get("last_text", "")
-        if target_text:
-            if api.copyToClip(target_text):
+        if SESSION_HISTORY:
+            latest_text = SESSION_HISTORY[0]["translated"]
+            if api.copyToClip(latest_text):
                 ui.message("Last result copied to clipboard.")
             else:
                 ui.message("Failed to copy to clipboard.")
@@ -394,6 +387,6 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         "kb:NVDA+shift+h": "openHistory",
         "kb:NVDA+shift+m": "toggleSpeech",
         "kb:NVDA+shift+z": "repeatLast",
-        "kb:NVDA+shift+c": "copyLast",
+        "kb:NVDA+shift+x": "copyLast",
         "kb:NVDA+shift+o": "openSettings",
     }
