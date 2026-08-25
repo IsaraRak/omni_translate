@@ -1,157 +1,72 @@
+﻿# -*- coding: utf-8 -*-
+import globalPluginHandler
+import ui
+import scriptHandler
+import api
+import textInfos
+import threading
 import json
 import os
 import re
-import threading
-import time
-import urllib.parse
 import urllib.request
+import urllib.parse
+import html
 import wx
-import api
-import globalPluginHandler
-import scriptHandler
-import textInfos
-import ui
 import gui
-import globalVars
-import queueHandler
-CONFIG_FILE = os.path.join(globalVars.appArgs.configPath, "omni_translate_conf.json")
-HISTORY_FILE = os.path.join(globalVars.appArgs.configPath, "omni_translate_history.json")
+from . import docHandler
+CONFIG_FILE = os.path.join(os.path.dirname(__file__), "omni_translate_config.json")
+HISTORY_FILE = os.path.join(os.path.dirname(__file__), "omni_translate_history.json")
+AVAILABLE_LANGUAGES = {
+    "auto": "Auto Detect", "af": "Afrikaans", "sq": "Albanian", "am": "Amharic", "ar": "Arabic",
+    "hy": "Armenian", "az": "Azerbaijani", "eu": "Basque", "be": "Belarusian", "bn": "Bengali",
+    "bs": "Bosnian", "bg": "Bulgarian", "ca": "Catalan", "ceb": "Cebuano", "ny": "Chichewa",
+    "zh-CN": "Chinese (Simplified)", "zh-TW": "Chinese (Traditional)", "co": "Corsican", "hr": "Croatian",
+    "cs": "Czech", "da": "Danish", "nl": "Dutch", "en": "English", "eo": "Esperanto",
+    "et": "Estonian", "tl": "Filipino", "fi": "Finnish", "fr": "French", "fy": "Frisian",
+    "gl": "Galician", "ka": "Georgian", "de": "German", "el": "Greek", "gu": "Gujarati",
+    "ht": "Haitian Creole", "ha": "Hausa", "haw": "Hawaiian", "iw": "Hebrew", "hi": "Hindi",
+    "hmn": "Hmong", "hu": "Hungarian", "is": "Icelandic", "ig": "Igbo", "id": "Indonesian",
+    "ga": "Irish", "it": "Italian", "ja": "Japanese", "jw": "Javanese", "kn": "Kannada",
+    "kk": "Kazakh", "km": "Khmer", "rw": "Kinyarwanda", "ko": "Korean", "ku": "Kurdish (Kurmanji)",
+    "ky": "Kyrgyz", "lo": "Lao", "la": "Latin", "lv": "Latvian", "lt": "Lithuanian",
+    "lb": "Luxembourgish", "mk": "Macedonian", "mg": "Malagasy", "ms": "Malay", "ml": "Malayalam",
+    "mt": "Maltese", "mi": "Maori", "mr": "Marathi", "mn": "Mongolian", "my": "Myanmar (Burmese)",
+    "ne": "Nepali", "no": "Norwegian", "or": "Odia (Oriya)", "ps": "Pashto", "fa": "Persian",
+    "pl": "Polish", "pt": "Portuguese", "pa": "Punjabi", "ro": "Romanian", "ru": "Russian",
+    "sm": "Samoan", "gd": "Scots Gaelic", "sr": "Serbian", "st": "Sesotho", "sn": "Shona",
+    "sd": "Sindhi", "si": "Sinhala", "sk": "Slovak", "sl": "Slovenian", "so": "Somali",
+    "es": "Spanish", "su": "Sundanese", "sw": "Swahili", "sv": "Swedish", "tg": "Tajik",
+    "ta": "Tamil", "tt": "Tatar", "te": "Telugu", "th": "Thai", "tr": "Turkish",
+    "tk": "Turkmen", "uk": "Ukrainian", "ur": "Urdu", "ug": "Uyghur", "uz": "Uzbek",
+    "vi": "Vietnamese", "cy": "Welsh", "xh": "Xhosa", "yi": "Yiddish", "yo": "Yoruba", "zu": "Zulu"
+}
 DEFAULT_CONFIG = {
     "sourceLang": "en",
     "targetLang": "th",
+    "autoDetect": True,
+    "copyToClipboard": False,
+    "speakResult": True,
     "quickSlot1": "th",
     "quickSlot2": "en",
     "quickSlot3": "ja",
     "quickSlot4": "zh-CN",
-    "quickSlot5": "ko",
-    "autoDetectMode": True,
-    "copyToClipboard": False,
-    "speakTranslation": True
+    "quickSlot5": "ko"
 }
-AVAILABLE_LANGUAGES = [
-    ("en", "English"),
-    ("th", "Thai - ภาษาไทย"),
-    ("ko", "Korean - 한국어 (Hangugeo)"),
-    ("ja", "Japanese - 日本語 (Nihongo)"),
-    ("zh-CN", "Chinese Simplified - 简体中文"),
-    ("zh-TW", "Chinese Traditional - 繁體中文"),
-    ("de", "German - Deutsch"),
-    ("fr", "French - Français"),
-    ("es", "Spanish - Español"),
-    ("ru", "Russian - Русский"),
-    ("it", "Italian - Italiano"),
-    ("pt", "Portuguese - Português"),
-    ("vi", "Vietnamese - Tiếng Việt"),
-    ("id", "Indonesian - Bahasa Indonesia"),
-    ("ar", "Arabic - العربية"),
-    ("hi", "Hindi - हिन्दी"),
-    ("af", "Afrikaans"),
-    ("sq", "Albanian - Shqip"),
-    ("am", "Amharic - አማርኛ"),
-    ("hy", "Armenian - Հայերեն"),
-    ("az", "Azerbaijani - Azərbaycan"),
-    ("eu", "Basque - Euskara"),
-    ("be", "Belarusian - Беларуская"),
-    ("bn", "Bengali - বাংলা"),
-    ("bs", "Bosnian - Bosanski"),
-    ("bg", "Bulgarian - Български"),
-    ("ca", "Catalan - Català"),
-    ("ceb", "Cebuano - Sinugboanon"),
-    ("co", "Corsican - Corsu"),
-    ("hr", "Croatian - Hrvatski"),
-    ("cs", "Czech - Čeština"),
-    ("da", "Danish - Dansk"),
-    ("nl", "Dutch - Nederlands"),
-    ("eo", "Esperanto"),
-    ("et", "Estonian - Eesti"),
-    ("fil", "Filipino (Tagalog) - Wikang Filipino"),
-    ("fi", "Finnish - Suomi"),
-    ("fy", "Frisian - Frysk"),
-    ("gl", "Galician - Galego"),
-    ("ka", "Georgian - ქართული"),
-    ("el", "Greek - Ελληνικά"),
-    ("gu", "Gujarati - ગુજરાતી"),
-    ("ht", "Haitian Creole - Kreyòl Ayisyen"),
-    ("ha", "Hausa"),
-    ("haw", "Hawaiian - ʻŌlelo Hawaiʻi"),
-    ("he", "Hebrew - עברית"),
-    ("hmn", "Hmong - Hmoob"),
-    ("hu", "Hungarian - Magyar"),
-    ("is", "Icelandic - Íslenska"),
-    ("ig", "Igbo - Asụsụ Igbo"),
-    ("ga", "Irish - Gaeilge"),
-    ("jv", "Javanese - Basa Jawa (ชวา)"),
-    ("kn", "Kannada - ಕನ್ನಡ"),
-    ("kk", "Kazakh - Қазақชา"),
-    ("km", "Khmer - ភាសាខ្មែរ"),
-    ("rw", "Kinyarwanda - Ikinyarwanda"),
-    ("ku", "Kurdish - Kurdî"),
-    ("ky", "Kyrgyz - Кыргызча"),
-    ("lo", "Lao - ພາສາລາວ"),
-    ("la", "Latin - Latina"),
-    ("lv", "Latvian - Latviešu"),
-    ("lt", "Lithuanian - Lietuvių"),
-    ("lb", "Luxembourgish - Lëtzebuergesch"),
-    ("mk", "Macedonian - Македонски"),
-    ("mg", "Malagasy"),
-    ("ms", "Malay - Bahasa Melayu"),
-    ("ml", "Malayalam - മലയാളം"),
-    ("mt", "Maltese - Malti"),
-    ("mi", "Maori - Te Reo Māori"),
-    ("mr", "Marathi - मराठी"),
-    ("mn", "Mongolian - Монгол"),
-    ("my", "Myanmar (Burmese) - မြန်မာစာ"),
-    ("ne", "Nepali - Nepali"),
-    ("no", "Norwegian - Norsk"),
-    ("ny", "Nyanja (Chichewa) - Chichewa"),
-    ("or", "Odia (Oriya) - ଓଡ଼ିଆ"),
-    ("ps", "Pashto - پښتو"),
-    ("fa", "Persian - فارسی"),
-    ("pl", "Polish - Polski"),
-    ("pa", "Punjabi - ਪੰਜਾਬੀ"),
-    ("ro", "Romanian - Română"),
-    ("sm", "Samoan - Gagana Samoa"),
-    ("gd", "Scots Gaelic - Gàidhlig"),
-    ("sr", "Serbian - Српски"),
-    ("st", "Sesotho"),
-    ("sn", "Shona - ChiShona"),
-    ("sd", "Sindhi - سنڌي"),
-    ("si", "Sinhala - Sinhala"),
-    ("sk", "Slovak - Slovenčina"),
-    ("sl", "Slovenian - Slovenščina"),
-    ("so", "Somali - Soomaali"),
-    ("su", "Sundanese - Basa Sunda"),
-    ("sw", "Swahili - Kiswahili"),
-    ("sv", "Swedish - Svenska"),
-    ("tg", "Tajik - Тоҷикӣ"),
-    ("ta", "Tamil - தமிழ்"),
-    ("tt", "Tatar - Татарча"),
-    ("te", "Telugu - తెలుగు"),
-    ("tr", "Turkish - Türkçe"),
-    ("tk", "Turkmen - Türkmençe"),
-    ("uk", "Ukrainian - Українська"),
-    ("ur", "Urdu - اردو"),
-    ("ug", "Uyghur - ئۇيغۇرچە"),
-    ("uz", "Uzbek - Oʻzbek"),
-    ("cy", "Welsh - Cymraeg"),
-    ("xh", "Xhosa - isiXhosa"),
-    ("yi", "Yiddish - Yiddish"),
-    ("yo", "Yoruba - Èdè Yorùbá"),
-    ("zu", "Zulu - isiZulu"),
-]
-QUICK_SLOT_CHOICES = [("none", "-- None (Disabled) --")] + AVAILABLE_LANGUAGES
-def load_conf():
+def load_config():
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                return {**DEFAULT_CONFIG, **json.load(f)}
+                cfg = json.load(f)
+                res = DEFAULT_CONFIG.copy()
+                res.update(cfg)
+                return res
         except Exception:
             pass
     return DEFAULT_CONFIG.copy()
-def save_conf(conf):
+def save_config(cfg):
     try:
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-            json.dump(conf, f, ensure_ascii=False, indent=2)
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
     except Exception:
         pass
 def load_history():
@@ -162,380 +77,304 @@ def load_history():
         except Exception:
             pass
     return []
-def add_to_history(original, translated):
-    history = load_history()
-    entry = {"original": original, "translated": translated, "time": time.strftime("%H:%M:%S")}
-    history.insert(0, entry)
-    history = history[:10]
+def save_history(entry):
     try:
+        history = load_history()
+        history.insert(0, entry)
+        history = history[:10]
         with open(HISTORY_FILE, "w", encoding="utf-8") as f:
             json.dump(history, f, ensure_ascii=False, indent=2)
     except Exception:
         pass
-def get_lang_name(code):
-    for c, name in AVAILABLE_LANGUAGES:
-        if c == code:
-            return name
-    return code
-def get_selected_text_fast():
+def fetch_translation_api(text, sl, tl):
+    encoded_text = urllib.parse.quote(text)
+    url = f"https://translate.googleapis.com/translate_a/single?client=gtx&sl={sl}&tl={tl}&dt=t&ie=UTF-8&oe=UTF-8&q={encoded_text}"
+    req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'})
+    with urllib.request.urlopen(req, timeout=10) as response:
+        raw_data = response.read().decode('utf-8')
+        data = json.loads(raw_data)
+        translated_text = "".join([part[0] for part in data[0] if part and part[0]])
+        detected_src = data[2] if len(data) > 2 and data[2] else sl
+        return translated_text, detected_src
+def fetch_translation_web(text, sl, tl):
+    encoded_text = urllib.parse.quote(text)
+    url = f"https://translate.google.com/m?sl={sl}&tl={tl}&hl=en&q={encoded_text}"
+    req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'})
+    with urllib.request.urlopen(req, timeout=10) as response:
+        html_content = response.read().decode('utf-8', errors='ignore')
+        match = re.search(r'<div class="result-container">(.*?)</div>', html_content, re.DOTALL)
+        if match:
+            translated_text = html.unescape(match.group(1).strip())
+            return translated_text, sl
+        raise Exception("Web parsing failed")
+def execute_translation(text, sl, tl):
     try:
-        obj = api.getFocusObject()
-        treeInterceptor = getattr(obj, "treeInterceptor", None)
-        if treeInterceptor and hasattr(treeInterceptor, "makeTextInfo"):
-            info = treeInterceptor.makeTextInfo(textInfos.POSITION_SELECTION)
-            if info and info.text and info.text.strip():
-                return info.text.strip()
+        translated_text, detected_lang = fetch_translation_api(text, sl, tl)
+        cfg = load_config()
+        secondary_lang = cfg.get("sourceLang", "en")
+        # Smart Dual-Language Routing:
+        # If detected language matches primary target, and primary target differs from secondary,
+        # automatically re-route translation to the secondary language.
+        if detected_lang == tl and secondary_lang != tl:
+            translated_text, _ = fetch_translation_api(text, detected_lang, secondary_lang)
+            return translated_text, detected_lang, secondary_lang
+        return translated_text, detected_lang, tl
     except Exception:
         pass
     try:
-        obj = api.getFocusObject()
-        if hasattr(obj, "makeTextInfo"):
-            info = obj.makeTextInfo(textInfos.POSITION_SELECTION)
-            if info and info.text and info.text.strip():
-                return info.text.strip()
-    except Exception:
-        pass
-    try:
-        clip = api.getClipData()
-        if clip and clip.strip():
-            return clip.strip()
-    except Exception:
-        pass
-    return ""
-def execute_translation(text, source_lang, target_lang, auto_mode=True):
-    sl = "auto" if auto_mode else source_lang
-    tl = target_lang
-    try:
-        query_params = {
-            "client": "gtx",
-            "sl": sl,
-            "tl": tl,
-            "dt": "t",
-            "ie": "UTF-8",
-            "oe": "UTF-8",
-            "q": text
-        }
-        encoded_url = "https://translate.googleapis.com/translate_a/single?" + urllib.parse.urlencode(query_params, encoding="utf-8")
-        req = urllib.request.Request(
-            encoded_url,
-            headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-                "Accept-Charset": "utf-8"
-            }
-        )
-        with urllib.request.urlopen(req, timeout=3.5) as res:
-            charset = res.headers.get_content_charset() or "utf-8"
-            raw_data = res.read().decode(charset, errors="replace")
-            data = json.loads(raw_data)
-            if isinstance(data, list) and len(data) > 0 and isinstance(data[0], list):
-                parts = [str(item[0]) for item in data[0] if item and len(item) > 0 and item[0]]
-                if parts:
-                    return "".join(parts)
-    except Exception:
-        pass
-    try:
-        m_params = {
-            "sl": sl,
-            "tl": tl,
-            "ie": "UTF-8",
-            "q": text
-        }
-        m_url = "https://translate.google.com/m?" + urllib.parse.urlencode(m_params, encoding="utf-8")
-        m_req = urllib.request.Request(
-            m_url,
-            headers={
-                "User-Agent": "Mozilla/5.0 (Android; Mobile; rv:40.0) Gecko/40.0 Firefox/40.0",
-                "Accept-Charset": "utf-8"
-            }
-        )
-        with urllib.request.urlopen(m_req, timeout=3.5) as m_res:
-            m_charset = m_res.headers.get_content_charset() or "utf-8"
-            html = m_res.read().decode(m_charset, errors="replace")
-            match = re.search(r'class="result-container">([^<]+)<', html)
-            if match:
-                import html as html_lib
-                return html_lib.unescape(match.group(1))
-    except Exception:
-        pass
-    return ""
-class ResultViewerDialog(wx.Dialog):
-    def __init__(self, parent, text):
-        super().__init__(parent, title="OmniTranslate - Result Viewer", style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
-        self.text = text
-        sizer = wx.BoxSizer(wx.VERTICAL)
-        self.textCtrl = wx.TextCtrl(self, value=text, style=wx.TE_MULTILINE | wx.TE_READONLY | wx.HSCROLL)
-        sizer.Add(self.textCtrl, 1, wx.EXPAND | wx.ALL, 10)
-        btnSizer = wx.BoxSizer(wx.HORIZONTAL)
-        copyBtn = wx.Button(self, label="&Copy Text")
-        closeBtn = wx.Button(self, wx.ID_CLOSE, label="&Close")
-        copyBtn.Bind(wx.EVT_BUTTON, self.onCopy)
-        closeBtn.Bind(wx.EVT_BUTTON, lambda evt: self.Close())
-        btnSizer.Add(copyBtn, 0, wx.RIGHT, 5)
-        btnSizer.Add(closeBtn, 0)
-        sizer.Add(btnSizer, 0, wx.ALIGN_RIGHT | wx.ALL, 10)
-        self.SetSizer(sizer)
-        self.SetSize((500, 350))
-        self.CenterOnScreen()
-        self.textCtrl.SetFocus()
-    def onCopy(self, event):
-        try:
-            api.copyToClip(self.text)
-            queueHandler.queueFunction(queueHandler.eventQueue, ui.message, "Copied to clipboard")
-        except Exception:
-            pass
-class HistoryDialog(wx.Dialog):
-    def __init__(self, parent):
-        super().__init__(parent, title="OmniTranslate - Translation History", style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
+        translated_text, detected_lang = fetch_translation_web(text, sl, tl)
+        return translated_text, detected_lang, tl
+    except Exception as e:
+        raise Exception(f"Translation engines unavailable: {str(e)}")
+class ResultViewerDialog(gui.SettingsDialog):
+    title = "OmniTranslate - Translation Result"
+    def __init__(self, parent, result_text):
+        self.result_text = result_text
+        super(ResultViewerDialog, self).__init__(parent)
+    def makeSettings(self, settingsSizer):
+        sHelper = gui.guiHelper.BoxSizerHelper(self, sizer=settingsSizer)
+        self.resultEdit = sHelper.addLabeledControl("Translated text:", wx.TextCtrl, style=wx.TE_MULTILINE | wx.TE_READONLY)
+        self.resultEdit.SetValue(self.result_text)
+        self.resultEdit.SetFocus()
+    def postInit(self):
+        super(ResultViewerDialog, self).postInit()
+        self.copyBtn = wx.Button(self, label="Copy to Clipboard")
+        self.copyBtn.Bind(wx.EVT_BUTTON, self.onCopy)
+        self.ButtonSizer.Insert(0, self.copyBtn, flag=wx.RIGHT, border=5)
+    def onCopy(self, evt):
+        if api.copyToClip(self.result_text):
+            ui.message("Copied to clipboard")
+        self.Close()
+class HistoryDialog(gui.SettingsDialog):
+    title = "OmniTranslate - History"
+    def makeSettings(self, settingsSizer):
+        sHelper = gui.guiHelper.BoxSizerHelper(self, sizer=settingsSizer)
         self.history = load_history()
-        sizer = wx.BoxSizer(wx.VERTICAL)
-        items = [f"[{h.get('time', '')}] {h.get('original', '')[:30]} -> {h.get('translated', '')[:40]}" for h in self.history]
-        if not items:
-            items = ["No translation history recorded yet"]
-        self.listBox = wx.ListBox(self, choices=items)
-        if self.history:
-            self.listBox.SetSelection(0)
-        sizer.Add(self.listBox, 1, wx.EXPAND | wx.ALL, 10)
-        btnSizer = wx.BoxSizer(wx.HORIZONTAL)
-        viewBtn = wx.Button(self, label="&View Full")
-        copyBtn = wx.Button(self, label="&Copy Translated")
-        closeBtn = wx.Button(self, wx.ID_CLOSE, label="&Close")
-        viewBtn.Bind(wx.EVT_BUTTON, self.onView)
-        copyBtn.Bind(wx.EVT_BUTTON, self.onCopy)
-        closeBtn.Bind(wx.EVT_BUTTON, lambda evt: self.Close())
-        btnSizer.Add(viewBtn, 0, wx.RIGHT, 5)
-        btnSizer.Add(copyBtn, 0, wx.RIGHT, 5)
-        btnSizer.Add(closeBtn, 0)
-        sizer.Add(btnSizer, 0, wx.ALIGN_RIGHT | wx.ALL, 10)
-        self.SetSizer(sizer)
-        self.SetSize((550, 400))
-        self.CenterOnScreen()
-    def onView(self, event):
-        idx = self.listBox.GetSelection()
-        if idx != wx.NOT_FOUND and self.history:
-            entry = self.history[idx]
-            msg = f"Original:\n{entry.get('original', '')}\n\nTranslated:\n{entry.get('translated', '')}"
-            dlg = ResultViewerDialog(self, msg)
-            dlg.ShowModal()
-            dlg.Destroy()
-    def onCopy(self, event):
-        idx = self.listBox.GetSelection()
-        if idx != wx.NOT_FOUND and self.history:
-            entry = self.history[idx]
-            api.copyToClip(entry.get('translated', ''))
-            queueHandler.queueFunction(queueHandler.eventQueue, ui.message, "Copied translation to clipboard")
-class SettingsDialog(wx.Dialog):
-    def __init__(self, parent):
-        super().__init__(parent, title="OmniTranslate Settings", style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
-        self.conf = load_conf()
-        mainSizer = wx.BoxSizer(wx.VERTICAL)
-        lang_labels = [lang[1] for lang in AVAILABLE_LANGUAGES]
-        lang_codes = [lang[0] for lang in AVAILABLE_LANGUAGES]
-        slot_labels = [lang[1] for lang in QUICK_SLOT_CHOICES]
-        slot_codes = [lang[0] for lang in QUICK_SLOT_CHOICES]
-        mainSizer.Add(wx.StaticText(self, label="Source Language:"), 0, wx.ALL, 4)
-        self.srcChoice = wx.Choice(self, choices=lang_labels)
-        currentSrc = self.conf.get("sourceLang", "en")
-        self.srcChoice.SetSelection(lang_codes.index(currentSrc) if currentSrc in lang_codes else 0)
-        mainSizer.Add(self.srcChoice, 0, wx.EXPAND | wx.ALL, 4)
-        mainSizer.Add(wx.StaticText(self, label="Target Language:"), 0, wx.ALL, 4)
-        self.targetChoice = wx.Choice(self, choices=lang_labels)
-        currentTarget = self.conf.get("targetLang", "th")
-        self.targetChoice.SetSelection(lang_codes.index(currentTarget) if currentTarget in lang_codes else 1)
-        mainSizer.Add(self.targetChoice, 0, wx.EXPAND | wx.ALL, 4)
-        self.slotChoices = []
+        choices = [f"[{h.get('from','?') }->{h.get('to','?')}] {h.get('original','')[:25]}... -> {h.get('translated','')[:25]}..." for h in self.history]
+        if not choices:
+            choices = ["No translation history available."]
+        self.historyList = sHelper.addLabeledControl("Recent Translations (10 max):", wx.ListBox, choices=choices)
+        self.historyList.SetSelection(0)
+        self.historyList.SetFocus()
+    def postInit(self):
+        super(HistoryDialog, self).postInit()
+        self.viewBtn = wx.Button(self, label="View Translation")
+        self.viewBtn.Bind(wx.EVT_BUTTON, self.onView)
+        self.ButtonSizer.Insert(0, self.viewBtn, flag=wx.RIGHT, border=5)
+    def onView(self, evt):
+        sel = self.historyList.GetSelection()
+        if sel != wx.NOT_FOUND and self.history:
+            entry = self.history[sel]
+            full_text = f"Source [{entry.get('from','?')}]:\n{entry.get('original','')}\n\nTranslation [{entry.get('to','?')}]:\n{entry.get('translated','')}"
+            gui.mainFrame.prePopup()
+            d = ResultViewerDialog(gui.mainFrame, full_text)
+            d.Show()
+            gui.mainFrame.postPopup()
+        self.Close()
+class SettingsDialog(gui.SettingsDialog):
+    title = "OmniTranslate Settings"
+    def makeSettings(self, settingsSizer):
+        sHelper = gui.guiHelper.BoxSizerHelper(self, sizer=settingsSizer)
+        self.cfg = load_config()
+        self.lang_keys = list(AVAILABLE_LANGUAGES.keys())
+        self.lang_names = list(AVAILABLE_LANGUAGES.values())
+        src_choices = [AVAILABLE_LANGUAGES[k] for k in self.lang_keys if k != "auto"]
+        src_keys = [k for k in self.lang_keys if k != "auto"]
+        src_idx = src_keys.index(self.cfg.get("sourceLang", "en")) if self.cfg.get("sourceLang", "en") in src_keys else 0
+        self.srcChoice = sHelper.addLabeledControl("Secondary / Source language:", wx.Choice, choices=src_choices)
+        self.srcChoice.SetSelection(src_idx)
+        self.src_keys = src_keys
+        tgt_choices = [AVAILABLE_LANGUAGES[k] for k in self.lang_keys if k != "auto"]
+        tgt_keys = [k for k in self.lang_keys if k != "auto"]
+        tgt_idx = tgt_keys.index(self.cfg.get("targetLang", "th")) if self.cfg.get("targetLang", "th") in tgt_keys else 0
+        self.tgtChoice = sHelper.addLabeledControl("Primary Target language:", wx.Choice, choices=tgt_choices)
+        self.tgtChoice.SetSelection(tgt_idx)
+        self.tgt_keys = tgt_keys
+        self.autoDetectCheck = sHelper.addItem(wx.CheckBox(self, label="Auto-detect source language"))
+        self.autoDetectCheck.SetValue(self.cfg.get("autoDetect", True))
+        self.copyCheck = sHelper.addItem(wx.CheckBox(self, label="Automatically copy translation to clipboard"))
+        self.copyCheck.SetValue(self.cfg.get("copyToClipboard", False))
+        self.speakCheck = sHelper.addItem(wx.CheckBox(self, label="Speak translation automatically"))
+        self.speakCheck.SetValue(self.cfg.get("speakResult", True))
+        self.slotControls = []
         for i in range(1, 6):
-            key = f"quickSlot{i}"
-            val = self.conf.get(key, DEFAULT_CONFIG.get(key, "none"))
-            mainSizer.Add(wx.StaticText(self, label=f"Quick-Cycle Target Slot {i} (NVDA+Shift+L):"), 0, wx.ALL, 3)
-            choice = wx.Choice(self, choices=slot_labels)
-            choice.SetSelection(slot_codes.index(val) if val in slot_codes else 0)
-            mainSizer.Add(choice, 0, wx.EXPAND | wx.ALL, 3)
-            self.slotChoices.append(choice)
-        self.autoDetectCheck = wx.CheckBox(
-            self, 
-            label="Auto-detect source language"
-        )
-        self.autoDetectCheck.SetValue(self.conf.get("autoDetectMode", True))
-        mainSizer.Add(self.autoDetectCheck, 0, wx.ALL, 4)
-        self.speakCheck = wx.CheckBox(self, label="Speak translation aloud via Screen Reader")
-        self.speakCheck.SetValue(self.conf.get("speakTranslation", True))
-        mainSizer.Add(self.speakCheck, 0, wx.ALL, 4)
-        self.copyCheck = wx.CheckBox(self, label="Automatically copy translated text to clipboard")
-        self.copyCheck.SetValue(self.conf.get("copyToClipboard", False))
-        mainSizer.Add(self.copyCheck, 0, wx.ALL, 4)
-        btnSizer = self.CreateButtonSizer(wx.OK | wx.CANCEL)
-        mainSizer.Add(btnSizer, 0, wx.ALIGN_RIGHT | wx.ALL, 8)
-        self.SetSizer(mainSizer)
-        mainSizer.Fit(self)
-        self.CenterOnScreen()
-    def save(self):
-        slot_codes = [lang[0] for lang in QUICK_SLOT_CHOICES]
-        self.conf["sourceLang"] = AVAILABLE_LANGUAGES[self.srcChoice.GetSelection()][0]
-        self.conf["targetLang"] = AVAILABLE_LANGUAGES[self.targetChoice.GetSelection()][0]
-        for i, choice in enumerate(self.slotChoices, start=1):
-            sel_code = slot_codes[choice.GetSelection()]
-            self.conf[f"quickSlot{i}"] = sel_code
-        self.conf["autoDetectMode"] = self.autoDetectCheck.GetValue()
-        self.conf["speakTranslation"] = self.speakCheck.GetValue()
-        self.conf["copyToClipboard"] = self.copyCheck.GetValue()
-        save_conf(self.conf)
+            slot_key = f"quickSlot{i}"
+            cur_lang = self.cfg.get(slot_key, "en")
+            s_idx = tgt_keys.index(cur_lang) if cur_lang in tgt_keys else 0
+            ctrl = sHelper.addLabeledControl(f"Quick Cycle Slot {i}:", wx.Choice, choices=tgt_choices)
+            ctrl.SetSelection(s_idx)
+            self.slotControls.append(ctrl)
+    def onOk(self, evt):
+        self.cfg["sourceLang"] = self.src_keys[self.srcChoice.GetSelection()]
+        self.cfg["targetLang"] = self.tgt_keys[self.tgtChoice.GetSelection()]
+        self.cfg["autoDetect"] = self.autoDetectCheck.GetValue()
+        self.cfg["copyToClipboard"] = self.copyCheck.GetValue()
+        self.cfg["speakResult"] = self.speakCheck.GetValue()
+        for i, ctrl in enumerate(self.slotControls, 1):
+            self.cfg[f"quickSlot{i}"] = self.tgt_keys[ctrl.GetSelection()]
+        save_config(self.cfg)
+        super(SettingsDialog, self).onOk(evt)
 class GlobalPlugin(globalPluginHandler.GlobalPlugin):
+    scriptCategory = "OmniTranslate"
     def __init__(self):
-        super().__init__()
+        super(GlobalPlugin, self).__init__()
         self.last_translated_text = ""
-        self.last_original_text = ""
-    def show_settings_dialog(self):
-        def _show():
+        self.current_slot_index = 0
+        self.settings_item = None
+        self.help_item = None
+        if hasattr(gui, "mainFrame") and hasattr(gui.mainFrame, "sysTrayIcon"):
             try:
-                dlg = SettingsDialog(gui.mainFrame)
-                if dlg.ShowModal() == wx.ID_OK:
-                    dlg.save()
-                    queueHandler.queueFunction(queueHandler.eventQueue, ui.message, "Settings saved")
-                dlg.Destroy()
-            except Exception as e:
-                queueHandler.queueFunction(queueHandler.eventQueue, ui.message, f"Error: {str(e)}")
-        wx.CallAfter(_show)
-    def _worker(self, text, conf):
-        try:
-            res = execute_translation(
-                text,
-                source_lang=conf.get("sourceLang", "en"),
-                target_lang=conf.get("targetLang", "th"),
-                auto_mode=conf.get("autoDetectMode", True)
-            )
-            if not res or not res.strip():
-                queueHandler.queueFunction(queueHandler.eventQueue, ui.message, "No translation result")
-                return
-            self.last_translated_text = res
-            self.last_original_text = text
-            add_to_history(text, res)
-            if conf.get("speakTranslation", True):
-                queueHandler.queueFunction(queueHandler.eventQueue, ui.message, res)
-            if conf.get("copyToClipboard", False):
-                try:
-                    api.copyToClip(res)
-                except Exception:
-                    pass
-        except Exception as e:
-            queueHandler.queueFunction(queueHandler.eventQueue, ui.message, f"Translation error: {str(e)}")
-    @scriptHandler.script(
-        description="Translate selected text or clipboard content (NVDA+Shift+T)",
-        category="OmniTranslate"
-    )
-    def script_translate(self, gesture):
-        conf = load_conf()
-        text = get_selected_text_fast()
-        if not text:
-            queueHandler.queueFunction(queueHandler.eventQueue, ui.message, "No text found to translate")
-            return
-        if conf.get("speakTranslation", True):
-            queueHandler.queueFunction(queueHandler.eventQueue, ui.message, "Translating...")
-        t = threading.Thread(target=self._worker, args=(text, conf))
-        t.daemon = True
-        t.start()
-    @scriptHandler.script(
-        description="Swap source and target languages (NVDA+Shift+S)",
-        category="OmniTranslate"
-    )
-    def script_swap(self, gesture):
-        conf = load_conf()
-        src = conf.get("sourceLang", "en")
-        target = conf.get("targetLang", "th")
-        conf["sourceLang"] = target
-        conf["targetLang"] = src
-        save_conf(conf)
-        queueHandler.queueFunction(queueHandler.eventQueue, ui.message, f"Swapped: {get_lang_name(target)} to {get_lang_name(src)}")
-    @scriptHandler.script(
-        description="Quick cycle target language across the 5 configured slots (NVDA+Shift+L)",
-        category="OmniTranslate"
-    )
-    def script_quickSwitch(self, gesture):
-        conf = load_conf()
-        cycle_list = []
-        for i in range(1, 6):
-            slot_val = conf.get(f"quickSlot{i}", "none")
-            if slot_val and slot_val != "none" and slot_val not in cycle_list:
-                cycle_list.append(slot_val)
-        if not cycle_list:
-            cycle_list = ["th", "en"]
-        cur_target = conf.get("targetLang", "th")
-        if cur_target in cycle_list:
-            idx = (cycle_list.index(cur_target) + 1) % len(cycle_list)
-            new_target = cycle_list[idx]
-        else:
-            new_target = cycle_list[0]
-        conf["targetLang"] = new_target
-        save_conf(conf)
-        queueHandler.queueFunction(queueHandler.eventQueue, ui.message, f"Target: {get_lang_name(new_target)}")
-    @scriptHandler.script(
-        description="Toggle speech output for translations / Silent Mode (NVDA+Shift+M)",
-        category="OmniTranslate"
-    )
-    def script_toggleSpeech(self, gesture):
-        conf = load_conf()
-        new_val = not conf.get("speakTranslation", True)
-        conf["speakTranslation"] = new_val
-        save_conf(conf)
-        queueHandler.queueFunction(queueHandler.eventQueue, ui.message, "Speech output ON" if new_val else "Silent mode ON (Speech OFF)")
-    @scriptHandler.script(
-        description="Open translation result viewer for detailed reading (NVDA+Shift+V)",
-        category="OmniTranslate"
-    )
-    def script_openViewer(self, gesture):
-        if not self.last_translated_text:
-            queueHandler.queueFunction(queueHandler.eventQueue, ui.message, "No translation available to view")
-            return
-        def _show():
-            dlg = ResultViewerDialog(gui.mainFrame, self.last_translated_text)
-            dlg.ShowModal()
-            dlg.Destroy()
-        wx.CallAfter(_show)
-    @scriptHandler.script(
-        description="Open Translation History dialog (NVDA+Shift+H)",
-        category="OmniTranslate"
-    )
-    def script_openHistory(self, gesture):
-        def _show():
-            dlg = HistoryDialog(gui.mainFrame)
-            dlg.ShowModal()
-            dlg.Destroy()
-        wx.CallAfter(_show)
-    @scriptHandler.script(
-        description="Open OmniTranslate Settings dialog (NVDA+Shift+O)",
-        category="OmniTranslate"
-    )
-    def script_openSettings(self, gesture):
-        self.show_settings_dialog()
-    @scriptHandler.script(
-        description="Announce last translated text (NVDA+Shift+A)",
-        category="OmniTranslate"
-    )
-    def script_announceLast(self, gesture):
-        if self.last_translated_text:
-            queueHandler.queueFunction(queueHandler.eventQueue, ui.message, self.last_translated_text)
-        else:
-            queueHandler.queueFunction(queueHandler.eventQueue, ui.message, "No previous translation available")
-    @scriptHandler.script(
-        description="Copy last translated text to clipboard (NVDA+Shift+C)",
-        category="OmniTranslate"
-    )
-    def script_copyLast(self, gesture):
-        if self.last_translated_text:
-            try:
-                api.copyToClip(self.last_translated_text)
-                queueHandler.queueFunction(queueHandler.eventQueue, ui.message, "Copied last translation to clipboard")
+                tools_menu = gui.mainFrame.sysTrayIcon.toolsMenu
+                self.settings_item = tools_menu.Append(wx.ID_ANY, "OmniTranslate Settings...", "Configure OmniTranslate preferences")
+                gui.mainFrame.sysTrayIcon.Bind(wx.EVT_MENU, self.onSettingsMenu, self.settings_item)
             except Exception:
                 pass
+            try:
+                help_menu = gui.mainFrame.sysTrayIcon.helpMenu
+                self.help_item = help_menu.Append(wx.ID_ANY, "OmniTranslate Documentation", "View OmniTranslate user documentation")
+                gui.mainFrame.sysTrayIcon.Bind(wx.EVT_MENU, self.onHelpMenu, self.help_item)
+            except Exception:
+                pass
+    def terminate(self):
+        if hasattr(gui, "mainFrame") and hasattr(gui.mainFrame, "sysTrayIcon"):
+            try:
+                if self.settings_item:
+                    gui.mainFrame.sysTrayIcon.toolsMenu.RemoveItem(self.settings_item)
+                if self.help_item:
+                    gui.mainFrame.sysTrayIcon.helpMenu.RemoveItem(self.help_item)
+            except Exception:
+                pass
+        super(GlobalPlugin, self).terminate()
+    def onSettingsMenu(self, evt):
+        gui.mainFrame.prePopup()
+        d = SettingsDialog(gui.mainFrame)
+        d.Show()
+        gui.mainFrame.postPopup()
+    def onHelpMenu(self, evt):
+        docHandler.openDoc()
+    def get_selected_or_clipboard_text(self):
+        try:
+            focus = api.getFocusObject()
+            treeInterceptor = focus.treeInterceptor
+            if treeInterceptor and hasattr(treeInterceptor, 'makeTextInfo'):
+                info = treeInterceptor.makeTextInfo(textInfos.POSITION_SELECTION)
+                if info and not info.isCollapsed:
+                    text = info.text.strip()
+                    if text:
+                        return text
+            if hasattr(focus, 'makeTextInfo'):
+                info = focus.makeTextInfo(textInfos.POSITION_SELECTION)
+                if info and not info.isCollapsed:
+                    text = info.text.strip()
+                    if text:
+                        return text
+        except Exception:
+            pass
+        try:
+            clip = api.getClipData()
+            if clip and clip.strip():
+                return clip.strip()
+        except Exception:
+            pass
+        return None
+    def _async_translate(self, text, sl, tl):
+        try:
+            ui.message("Translating...")
+            result, actual_src, actual_tgt = execute_translation(text, sl, tl)
+            self.last_translated_text = result
+            cfg = load_config()
+            if cfg.get("copyToClipboard", False):
+                api.copyToClip(result)
+            if cfg.get("speakResult", True):
+                ui.message(result)
+            save_history({
+                "original": text,
+                "translated": result,
+                "from": actual_src,
+                "to": actual_tgt
+            })
+        except Exception as e:
+            ui.message(f"Translation Error: {str(e)}")
+    def script_translate(self, gesture):
+        text = self.get_selected_or_clipboard_text()
+        if not text:
+            ui.message("No text selected or found in clipboard.")
+            return
+        cfg = load_config()
+        sl = "auto" if cfg.get("autoDetect", True) else cfg.get("sourceLang", "en")
+        tl = cfg.get("targetLang", "th")
+        threading.Thread(target=self._async_translate, args=(text, sl, tl), daemon=True).start()
+    script_translate.__doc__ = "Translates selected text or clipboard content using OmniTranslate."
+    def script_swapLanguages(self, gesture):
+        cfg = load_config()
+        src = cfg.get("sourceLang", "en")
+        tgt = cfg.get("targetLang", "th")
+        cfg["sourceLang"] = tgt
+        cfg["targetLang"] = src
+        save_config(cfg)
+        src_name = AVAILABLE_LANGUAGES.get(tgt, tgt)
+        tgt_name = AVAILABLE_LANGUAGES.get(src, src)
+        ui.message(f"Languages swapped: Secondary {src_name}, Target {tgt_name}")
+    script_swapLanguages.__doc__ = "Swaps primary source and target languages."
+    def script_quickSwitch(self, gesture):
+        cfg = load_config()
+        slots = [cfg.get(f"quickSlot{i}", "en") for i in range(1, 6)]
+        self.current_slot_index = (self.current_slot_index + 1) % len(slots)
+        next_lang = slots[self.current_slot_index]
+        cfg["targetLang"] = next_lang
+        save_config(cfg)
+        lang_name = AVAILABLE_LANGUAGES.get(next_lang, next_lang)
+        ui.message(f"Target: Slot {self.current_slot_index + 1} ({lang_name})")
+    script_quickSwitch.__doc__ = "Cycles through 5 configured quick-switch target language slots."
+    def script_openViewer(self, gesture):
+        if not self.last_translated_text:
+            ui.message("No translation available to view.")
+            return
+        gui.mainFrame.prePopup()
+        d = ResultViewerDialog(gui.mainFrame, self.last_translated_text)
+        d.Show()
+        gui.mainFrame.postPopup()
+    script_openViewer.__doc__ = "Opens accessible Result Viewer dialog."
+    def script_openHistory(self, gesture):
+        gui.mainFrame.prePopup()
+        d = HistoryDialog(gui.mainFrame)
+        d.Show()
+        gui.mainFrame.postPopup()
+    script_openHistory.__doc__ = "Opens translation history dialog."
+    def script_toggleSpeech(self, gesture):
+        cfg = load_config()
+        cfg["speakResult"] = not cfg.get("speakResult", True)
+        save_config(cfg)
+        state = "enabled" if cfg["speakResult"] else "disabled"
+        ui.message(f"Speech output {state}")
+    script_toggleSpeech.__doc__ = "Toggles automatic speech output."
+    def script_repeatLast(self, gesture):
+        if self.last_translated_text:
+            ui.message(self.last_translated_text)
         else:
-            queueHandler.queueFunction(queueHandler.eventQueue, ui.message, "No previous translation available")
+            ui.message("No recent translation.")
+    script_repeatLast.__doc__ = "Repeats the last translated result."
+    def script_copyLast(self, gesture):
+        if self.last_translated_text:
+            if api.copyToClip(self.last_translated_text):
+                ui.message("Last result copied to clipboard.")
+        else:
+            ui.message("No recent translation.")
+    script_copyLast.__doc__ = "Copies the last translated result to clipboard."
+    def script_openSettings(self, gesture):
+        gui.mainFrame.prePopup()
+        d = SettingsDialog(gui.mainFrame)
+        d.Show()
+        gui.mainFrame.postPopup()
+    script_openSettings.__doc__ = "Opens OmniTranslate configuration dialog."
     __gestures = {
         "kb:NVDA+shift+t": "translate",
-        "kb:NVDA+shift+s": "swap",
-        "kb:NVDA+shift+l": "quickSwitch",
+        "kb:NVDA+shift+s": "swapLanguages",
+        "kb:NVDA+shift+j": "quickSwitch",
         "kb:NVDA+shift+v": "openViewer",
         "kb:NVDA+shift+h": "openHistory",
         "kb:NVDA+shift+m": "toggleSpeech",
-        "kb:NVDA+shift+o": "openSettings",
-        "kb:NVDA+shift+a": "announceLast",
+        "kb:NVDA+shift+z": "repeatLast",
         "kb:NVDA+shift+c": "copyLast",
+        "kb:NVDA+shift+o": "openSettings",
     }
