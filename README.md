@@ -14,6 +14,7 @@ OmniTranslate is a robust, bidirectional translation add-on for the NVDA screen 
 ### Version 2026.2.1
 * Added Smart Bidirectional Translation support.
 * Reordered and refined Settings dialog layout for better accessibility.
+* Changed translation history to in-memory session storage (cleared upon NVDA restart for privacy).
 * Updated shortcut for cycling target slots to **NVDA+Shift+J**.
 * Updated shortcut for repeating last translation to **NVDA+Shift+Z**.
 ## License
