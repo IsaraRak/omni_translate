@@ -1,0 +1,17 @@
+﻿# Development guidelines and AI instruction files
+AGENTS.md
+GEMINI.md
+
+# Python compiled bytecode and caches
+__pycache__/
+*.py[cod]
+*.class
+
+# Local downloaded offline neural models directory
+omni_translate_models/
+
+# OS and Editor temporary files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
