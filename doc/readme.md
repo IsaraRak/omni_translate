@@ -63,13 +63,17 @@ Users can manually add custom CTranslate2 models to OmniTranslate:
 
 ## Changelog
 
+### Version 2026.3.1
+* **Automatic Background Update Checker**: Integrated a lightweight, background update checker that monitors GitHub Releases for new versions and offers one-click seamless installation while fully preserving user configurations and offline models.
+* **Multiline & Paragraph Layout Preservation**: Advanced paragraph-by-paragraph translation pipeline preserving exact newline layouts, blank line separators, numbered lists ("1.", "2.", "3."), and bullet items using standard Windows CRLF (`\r\n`) formatting, preventing sentence cutoffs and text block collisions.
+* **Seamless Settings & Offline Model Retention on Upgrade**: Enhanced add-on lifecycle management (`installTasks.py`) to automatically detect version upgrades, safely preserving user configuration (`omni_translate_config.json`) and all downloaded neural models across add-on updates.
+
 ### Version 2026.3 (Major Release)
 * **Local Neural Offline Translation Engine**: Integrated CTranslate2 int8 neural engine with Meta NLLB-200 and Opus-MT support for fast, private, and 100% offline translation without requiring an internet connection.
 * **Universal Editable Selection Replacement**: Added setting (`Replace selected text with translation in editable fields`) to automatically replace selected text directly with its translation across text editors (Notepad, Word), system dialogs (Windows Run `Win+R`), desktop/web chat boxes, and in-game chat message boxes (DirectX/OpenGL).
 * **Instant Quick Slots Execution**: Selecting Quick Slots `1`–`5` in layer mode now switches the target language and executes the translation immediately in a single step.
 * **Keyboard Shortcut Adjustments**: Updated keyboard shortcuts; removed the manual language swap shortcut (now handled automatically by Smart Bidirectional Translation) and replaced key `S` with the **Translation Mode Toggle** (Online / Offline) with audible confirmation.
 * **Universal Smart Bidirectional Translation**: Automatically detects input language across all major Unicode writing systems and unaccented Latin text, routing seamlessly between primary target and secondary languages.
-* **Multiline & Paragraph Layout Preservation**: Preserves exact newline layout, paragraph breaks, and lists (`\n`) during translation, preventing text from colliding into run-on blocks.
 * **In-App Offline Model Manager**: Manage and download recommended offline neural models (600M / 1.3B) directly within NVDA Settings with progress announcements, model deletion, and custom model import support.
 * **Automatic Offline Failover**: Seamlessly falls back to local offline neural models if internet connectivity is lost or online services are unavailable.
 * **Configurable Clipboard Fallback**: Added a dedicated setting (`Translate text from clipboard when no text is selected`) allowing users to control whether clipboard contents are translated when no text is actively highlighted.
@@ -92,7 +96,7 @@ Users can manually add custom CTranslate2 models to OmniTranslate:
 ## Credits & Acknowledgments
 
 - **Author & Maintainer**: Isara Watthanawirojkul (<isara.rak@gmail.com>)
-- **Inspiration**: Inspired by the original *Instant Translate* add-on by Alexy Sadovoy, Mesar Hameed, and contributors.
+- **Inspiration & Tribute**: OmniTranslate is deeply inspired by the pioneering work of the beloved ***Instant Translate*** add-on, originally created by Alexy Sadovoy, Mesar Hameed, and its wonderful contributors. We honor their incredible contribution to the NVDA community, which laid the foundation for screen reader translation tools. OmniTranslate aims to carry this torch forward into the modern AI era with local neural offline intelligence.
 - **Online Translation Backend**: Powered by Google Translate service.
 - **CTranslate2**: Fast neural inference engine by OpenNMT / SYSTRAN (MIT License).
 - **SentencePiece**: Subword text tokenizer by Google (Apache 2.0 License).

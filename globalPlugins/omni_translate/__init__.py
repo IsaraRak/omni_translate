@@ -27,6 +27,7 @@ import controlTypes
 from . import docHandler
 from . import offlineEngine
 from . import settingsDialogs
+from . import updateChecker
 
 addonHandler.initTranslation()
 
@@ -84,12 +85,13 @@ def request_web_fallback(text, sl, tl):
         html_content = response.read().decode('utf-8', errors='ignore')
         match = re.search(r'<div class="result-container">(.*?)</div>', html_content, re.DOTALL)
         if match:
-            translated_text = html.unescape(match.group(1).strip())
+            raw_html = match.group(1).replace('<br>', '\n').replace('<br/>', '\n')
+            translated_text = html.unescape(raw_html.strip())
             return translated_text, sl
         raise Exception("Unable to extract translation from Web Engine")
 
 
-def translate_query(text, sl, tl):
+def translate_single_chunk(text, sl, tl):
     try:
         return request_api_endpoint(text, sl, tl, "gtx")
     except Exception as e:
@@ -99,6 +101,45 @@ def translate_query(text, sl, tl):
         except Exception as e:
             logHandler.log.debug(f"OmniTranslate: dict-chrome-ex endpoint failed: {e}")
             return request_web_fallback(text, sl, tl)
+
+
+def normalize_newlines(text):
+    """Normalizes all platform-specific and Unicode newline variants to standard newline."""
+    if not text or not isinstance(text, str):
+        return ""
+    return (
+        text.replace('\r\n', '\n')
+            .replace('\r', '\n')
+            .replace('\x0b', '\n')
+            .replace('\x0c', '\n')
+            .replace('\u2028', '\n')
+            .replace('\u2029', '\n')
+    )
+
+
+def translate_query(text, sl, tl):
+    if not text or not isinstance(text, str) or not text.strip():
+        return "", sl
+
+    normalized = normalize_newlines(text)
+    if '\n' not in normalized:
+        return translate_single_chunk(normalized.strip(), sl, tl)
+
+    lines = normalized.split('\n')
+    translated_lines = []
+    overall_detected = sl
+
+    for line in lines:
+        line_str = line.strip()
+        if not line_str:
+            translated_lines.append("")
+            continue
+        res_line, det_line = translate_single_chunk(line_str, sl, tl)
+        if det_line and det_line != "auto" and overall_detected in ("auto", sl):
+            overall_detected = det_line
+        translated_lines.append(res_line)
+
+    return "\r\n".join(translated_lines), overall_detected
 
 
 def execute_translation(text, sl, tl):
@@ -362,6 +403,10 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         self.current_slot_index = 0
         self._in_layer = False
         self._last_translate_time = 0.0
+        try:
+            updateChecker.start_update_checker_service()
+        except Exception as e:
+            logHandler.log.debug(f"OmniTranslate: Could not start update checker: {e}")
 
     def terminate(self):
         self._exitLayer()
@@ -649,7 +694,13 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 
         cfg = settingsDialogs.load_config()
         slot_key = f"quickSlot{slot_num}"
-        target_lang = cfg.get(slot_key, "en")
+        target_lang = cfg.get(slot_key, "none")
+
+        if not target_lang or target_lang in ("none", "", "Please select a language"):
+            tones.beep(200, 70)
+            ui.message(_("Cannot translate: Language slot {slot} is not configured. Please configure it in OmniTranslate settings.").format(slot=slot_num))
+            return
+
         settingsDialogs.save_config({"targetLang": target_lang})
         self.current_slot_index = slot_num - 1
         lang_name = settingsDialogs.AVAILABLE_LANGUAGES.get(target_lang, target_lang)

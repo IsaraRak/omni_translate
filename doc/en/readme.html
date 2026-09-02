@@ -64,6 +64,14 @@
     </ul>
 
     <h2>Changelog</h2>
+
+    <h3>Version 2026.3.1</h3>
+    <ul>
+        <li><strong>Automatic Background Update Checker:</strong> Integrated a lightweight, background update checker that monitors GitHub Releases for new versions and offers one-click seamless installation while fully preserving user configurations and offline models.</li>
+        <li><strong>Multiline &amp; Paragraph Layout Preservation:</strong> Advanced paragraph-by-paragraph translation pipeline preserving exact newline layouts, blank line separators, numbered lists ("1.", "2.", "3."), and bullet items using standard Windows CRLF (<code>\r\n</code>) formatting, preventing sentence cutoffs and text block collisions.</li>
+        <li><strong>Seamless Settings &amp; Offline Model Retention on Upgrade:</strong> Enhanced add-on lifecycle management (<code>installTasks.py</code>) to automatically detect version upgrades, safely preserving user configuration (<code>omni_translate_config.json</code>) and all downloaded neural models across add-on updates.</li>
+    </ul>
+
     <h3>Version 2026.3 (Major Release)</h3>
     <ul>
         <li><strong>Local Neural Offline Translation Engine:</strong> Integrated CTranslate2 int8 neural engine with Meta NLLB-200 and Opus-MT support for fast, private, and 100% offline translation without requiring an internet connection.</li>
@@ -71,7 +79,6 @@
         <li><strong>Instant Quick Slots Execution:</strong> Selecting Quick Slots <code>1</code>–<code>5</code> in layer mode now switches the target language and executes the translation immediately in a single step.</li>
         <li><strong>Keyboard Shortcut Adjustments:</strong> Updated keyboard shortcuts; removed the manual language swap shortcut (now handled automatically by Smart Bidirectional Translation) and replaced key <code>S</code> with the <strong>Translation Mode Toggle</strong> (Online / Offline) with audible confirmation.</li>
         <li><strong>Universal Smart Bidirectional Translation:</strong> Automatically detects input language across all major Unicode writing systems and unaccented Latin text, routing seamlessly between primary target and secondary languages.</li>
-        <li><strong>Multiline &amp; Paragraph Layout Preservation:</strong> Preserves exact newline layout, paragraph breaks, and lists (<code>\n</code>) during translation, preventing text from colliding into run-on blocks.</li>
         <li><strong>In-App Offline Model Manager:</strong> Manage and download recommended offline neural models (600M / 1.3B) directly within NVDA Settings with progress announcements, model deletion, and custom model import support.</li>
         <li><strong>Automatic Offline Failover:</strong> Seamlessly falls back to local offline neural models if internet connectivity is lost or online services are unavailable.</li>
         <li><strong>Configurable Clipboard Fallback:</strong> Added a dedicated setting (<em>Translate text from clipboard when no text is selected</em>) allowing users to control whether clipboard contents are translated when no text is actively highlighted.</li>
@@ -99,7 +106,7 @@
     <h2>Credits &amp; Acknowledgments</h2>
     <ul>
         <li><strong>Author &amp; Maintainer:</strong> Isara Watthanawirojkul (&lt;isara.rak@gmail.com&gt;)</li>
-        <li><strong>Inspiration:</strong> Inspired by the original <em>Instant Translate</em> add-on by Alexy Sadovoy, Mesar Hameed, and contributors.</li>
+        <li><strong>Inspiration &amp; Tribute:</strong> OmniTranslate is deeply inspired by the pioneering work of the beloved <em>Instant Translate</em> add-on, originally created by Alexy Sadovoy, Mesar Hameed, and its wonderful contributors. We honor their incredible contribution to the NVDA community, which laid the foundation for screen reader translation tools. OmniTranslate aims to carry this torch forward into the modern AI era with local neural offline intelligence.</li>
         <li><strong>Online Translation Backend:</strong> Powered by Google Translate service.</li>
         <li><strong>CTranslate2:</strong> Fast neural inference engine by OpenNMT / SYSTRAN (MIT License).</li>
         <li><strong>SentencePiece:</strong> Subword text tokenizer by Google (Apache 2.0 License).</li>

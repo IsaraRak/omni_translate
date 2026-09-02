@@ -358,11 +358,11 @@ DEFAULT_CONFIG = {
     "translateClipboard": True,
     "replaceSelection": False,
     "speakResult": True,
-    "quickSlot1": "th",
-    "quickSlot2": "en",
-    "quickSlot3": "ja",
-    "quickSlot4": "zh-CN",
-    "quickSlot5": "ko",
+    "quickSlot1": "none",
+    "quickSlot2": "none",
+    "quickSlot3": "none",
+    "quickSlot4": "none",
+    "quickSlot5": "none",
     "offlineModel": "none"
 }
 
@@ -511,12 +511,14 @@ class OmniTranslateGeneralSettingsPanel(SettingsPanel):
         self.srcChoice.SetSelection(src_idx)
 
         # Quick Slots 1 - 5
+        self.slot_keys = ["none"] + self.lang_keys
+        self.slot_names = [_("Please select a language")] + self.lang_names
         self.slotControls = []
         for i in range(1, 6):
             slot_key = f"quickSlot{i}"
-            cur_slot = self.cfg.get(slot_key, "en")
-            s_idx = self.lang_keys.index(cur_slot) if cur_slot in self.lang_keys else 0
-            ctrl = sHelper.addLabeledControl(_(f"Quick Slot {i}:"), wx.Choice, choices=self.lang_names)
+            cur_slot = self.cfg.get(slot_key, "none")
+            s_idx = self.slot_keys.index(cur_slot) if cur_slot in self.slot_keys else 0
+            ctrl = sHelper.addLabeledControl(_(f"Quick Slot {i}:"), wx.Choice, choices=self.slot_names)
             ctrl.SetSelection(s_idx)
             self.slotControls.append(ctrl)
 
@@ -570,11 +572,13 @@ class OmniTranslateGeneralSettingsPanel(SettingsPanel):
         prev_slot_keys = []
         for ctrl in self.slotControls:
             sel = ctrl.GetSelection()
-            prev_slot_keys.append(self.lang_keys[sel] if (self.lang_keys and 0 <= sel < len(self.lang_keys)) else "en")
+            prev_slot_keys.append(self.slot_keys[sel] if (hasattr(self, "slot_keys") and 0 <= sel < len(self.slot_keys)) else "none")
 
         self.lang_map = new_lang_map
         self.lang_keys = new_lang_keys
         self.lang_names = new_lang_names
+        self.slot_keys = ["none"] + self.lang_keys
+        self.slot_names = [_("Please select a language")] + self.lang_names
 
         all_controls = [self.tgtChoice, self.srcChoice] + self.slotControls
         for ctrl in all_controls:
@@ -595,10 +599,10 @@ class OmniTranslateGeneralSettingsPanel(SettingsPanel):
 
             # Update Quick Slots
             for i, ctrl in enumerate(self.slotControls):
-                ctrl.Set(self.lang_names)
-                prev_slot = prev_slot_keys[i] if i < len(prev_slot_keys) else "en"
-                new_slot_idx = self.lang_keys.index(prev_slot) if prev_slot in self.lang_keys else 0
-                if self.lang_names and 0 <= new_slot_idx < len(self.lang_names):
+                ctrl.Set(self.slot_names)
+                prev_slot = prev_slot_keys[i] if i < len(prev_slot_keys) else "none"
+                new_slot_idx = self.slot_keys.index(prev_slot) if prev_slot in self.slot_keys else 0
+                if self.slot_names and 0 <= new_slot_idx < len(self.slot_names):
                     ctrl.SetSelection(new_slot_idx)
         finally:
             self.Thaw()
@@ -626,8 +630,8 @@ class OmniTranslateGeneralSettingsPanel(SettingsPanel):
 
         for i, ctrl in enumerate(self.slotControls, 1):
             s_sel = ctrl.GetSelection()
-            if s_sel != wx.NOT_FOUND and 0 <= s_sel < len(self.lang_keys):
-                updates[f"quickSlot{i}"] = self.lang_keys[s_sel]
+            if s_sel != wx.NOT_FOUND and 0 <= s_sel < len(self.slot_keys):
+                updates[f"quickSlot{i}"] = self.slot_keys[s_sel]
 
         save_config(updates)
 

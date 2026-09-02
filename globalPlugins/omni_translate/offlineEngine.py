@@ -2374,6 +2374,20 @@ def get_language_display_name(code):
         return code
 
 
+def normalize_newlines(text):
+    """Normalizes all platform-specific and Unicode newline variants to standard newline."""
+    if not text or not isinstance(text, str):
+        return ""
+    return (
+        text.replace('\r\n', '\n')
+            .replace('\r', '\n')
+            .replace('\x0b', '\n')
+            .replace('\x0c', '\n')
+            .replace('\u2028', '\n')
+            .replace('\u2029', '\n')
+    )
+
+
 def translate_offline(text, model_id, src_lang="en", tgt_lang="th"):
     """Translates text offline with support for Multilingual and Bilingual models."""
     if not text or not isinstance(text, str) or not text.strip():
@@ -2393,7 +2407,7 @@ def translate_offline(text, model_id, src_lang="en", tgt_lang="th"):
         supp_info = get_model_supported_languages(model_id)
         is_multilingual = supp_info.get("is_multilingual", True)
 
-        lines = text.split("\n")
+        lines = normalize_newlines(text).split("\n")
         batch_inputs = []
         batch_indices = []
         max_raw_len = 1
@@ -2427,14 +2441,14 @@ def translate_offline(text, model_id, src_lang="en", tgt_lang="th"):
                 return text
 
             target_prefix = [[nllb_tgt]] * len(batch_inputs)
-            max_dec = max(32, int(max_raw_len * 3) + 10)
+            max_dec = max(128, int(max_raw_len * 4) + 64)
 
             results = translator.translate_batch(
                 batch_inputs,
                 target_prefix=target_prefix,
                 beam_size=4,
-                repetition_penalty=1.2,
-                no_repeat_ngram_size=3,
+                repetition_penalty=1.05,
+                no_repeat_ngram_size=0,
                 max_decoding_length=max_dec
             )
 
@@ -2446,7 +2460,7 @@ def translate_offline(text, model_id, src_lang="en", tgt_lang="th"):
                 cleaned = clean_output_text(translated, orig_line)
                 output_lines[line_idx] = cleaned if cleaned else orig_line
 
-            return "\n".join(output_lines)
+            return "\r\n".join(output_lines)
 
         else:
             # Bilingual Pair Mode (Opus-MT / Marian / Custom Pair)
@@ -2469,12 +2483,12 @@ def translate_offline(text, model_id, src_lang="en", tgt_lang="th"):
             if not batch_inputs:
                 return text
 
-            max_dec = max(32, int(max_raw_len * 3) + 10)
+            max_dec = max(128, int(max_raw_len * 4) + 64)
             results = translator.translate_batch(
                 batch_inputs,
                 beam_size=4,
-                repetition_penalty=1.2,
-                no_repeat_ngram_size=3,
+                repetition_penalty=1.05,
+                no_repeat_ngram_size=0,
                 max_decoding_length=max_dec
             )
 
@@ -2486,7 +2500,7 @@ def translate_offline(text, model_id, src_lang="en", tgt_lang="th"):
                 cleaned = clean_output_text(translated, orig_line)
                 output_lines[line_idx] = cleaned if cleaned else orig_line
 
-            return "\n".join(output_lines)
+            return "\r\n".join(output_lines)
 
     except Exception as e:
         logHandler.log.error(f"OmniTranslate: Translation execution error: {e}")

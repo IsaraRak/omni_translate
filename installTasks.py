@@ -9,8 +9,14 @@ import logHandler
 
 
 def onUninstall():
-    """Cleans up downloaded models and configuration files upon add-on uninstallation."""
+    """Cleans up downloaded models and configuration files upon add-on uninstallation,
+    while preserving them during add-on updates."""
     try:
+        pending_install_dir = os.path.join(globalVars.appArgs.configPath, "addons", "omni_translate.pendingInstall")
+        if os.path.exists(pending_install_dir):
+            logHandler.log.info("OmniTranslate: Update in progress. Preserving configuration and offline models.")
+            return
+
         models_dir = os.path.join(globalVars.appArgs.configPath, "omni_translate_models")
         if os.path.exists(models_dir):
             shutil.rmtree(models_dir, ignore_errors=True)
@@ -20,6 +26,7 @@ def onUninstall():
         if os.path.exists(conf_file):
             try:
                 os.remove(conf_file)
+                logHandler.log.info("OmniTranslate: Removed config file on uninstall.")
             except Exception:
                 pass
     except Exception as e:
