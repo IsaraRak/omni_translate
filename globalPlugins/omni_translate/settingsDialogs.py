@@ -363,6 +363,31 @@ DEFAULT_CONFIG = {
     "quickSlot3": "none",
     "quickSlot4": "none",
     "quickSlot5": "none",
+    "quickSlot6": "none",
+    "quickSlot7": "none",
+    "quickSlot8": "none",
+    "quickSlot9": "none",
+    "quickSlot10": "none",
+    "targetQuickSlot1": "none",
+    "targetQuickSlot2": "none",
+    "targetQuickSlot3": "none",
+    "targetQuickSlot4": "none",
+    "targetQuickSlot5": "none",
+    "targetQuickSlot6": "none",
+    "targetQuickSlot7": "none",
+    "targetQuickSlot8": "none",
+    "targetQuickSlot9": "none",
+    "targetQuickSlot10": "none",
+    "sourceQuickSlot1": "none",
+    "sourceQuickSlot2": "none",
+    "sourceQuickSlot3": "none",
+    "sourceQuickSlot4": "none",
+    "sourceQuickSlot5": "none",
+    "sourceQuickSlot6": "none",
+    "sourceQuickSlot7": "none",
+    "sourceQuickSlot8": "none",
+    "sourceQuickSlot9": "none",
+    "sourceQuickSlot10": "none",
     "offlineModel": "none"
 }
 
@@ -382,11 +407,15 @@ def load_config():
 
 
 def save_config(cfg_updates):
+    if getattr(globalVars.appArgs, "secureMode", False):
+        return
     try:
         current_cfg = load_config()
         current_cfg.update(cfg_updates)
-        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+        tmp_file = CONFIG_FILE + ".tmp"
+        with open(tmp_file, "w", encoding="utf-8") as f:
             json.dump(current_cfg, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_file, CONFIG_FILE)
     except Exception as e:
         logHandler.log.error(f"OmniTranslate: Error saving configuration: {e}")
 
@@ -405,9 +434,9 @@ class ResultViewerDialog(wx.Dialog):
 
         btnSizer = wx.BoxSizer(wx.HORIZONTAL)
         copyBtn = wx.Button(self, label=_("&Copy to Clipboard"))
-        closeBtn = wx.Button(self, wx.ID_CLOSE, label=_("&Close"))
+        closeBtn = wx.Button(self, wx.ID_CANCEL, label=_("&Close"))
         copyBtn.Bind(wx.EVT_BUTTON, self.onCopy)
-        closeBtn.Bind(wx.EVT_BUTTON, lambda evt: self.Close())
+        closeBtn.Bind(wx.EVT_BUTTON, self.onClose)
 
         btnSizer.Add(copyBtn, 0, wx.RIGHT, 5)
         btnSizer.Add(closeBtn, 0)
@@ -417,11 +446,31 @@ class ResultViewerDialog(wx.Dialog):
         self.SetSize((550, 380))
         self.CenterOnScreen()
         self.textCtrl.SetFocus()
+        self.Bind(wx.EVT_CHAR_HOOK, self.onCharHook)
+        self.textCtrl.Bind(wx.EVT_KEY_DOWN, self.onTextKeyDown)
+
+    def onCharHook(self, evt):
+        if evt.GetKeyCode() == wx.WXK_ESCAPE:
+            self.onClose(evt)
+        else:
+            evt.Skip()
+
+    def onTextKeyDown(self, evt):
+        if evt.GetKeyCode() == wx.WXK_ESCAPE:
+            self.onClose(evt)
+        else:
+            evt.Skip()
+
+    def onClose(self, evt=None):
+        if self.IsModal():
+            self.EndModal(wx.ID_CANCEL)
+        else:
+            self.Destroy()
 
     def onCopy(self, evt):
         if api.copyToClip(self.result_text):
             ui.message(_("Copied to clipboard"))
-        self.Close()
+        self.onClose(evt)
 
 
 class HistoryDialog(wx.Dialog):
@@ -442,13 +491,16 @@ class HistoryDialog(wx.Dialog):
 
         self.listBox = wx.ListBox(self, choices=choices)
         self.listBox.SetSelection(0)
+        self.listBox.Bind(wx.EVT_LISTBOX_DCLICK, self.onView)
+        self.listBox.Bind(wx.EVT_KEY_DOWN, self.onListKeyDown)
         sizer.Add(self.listBox, 1, wx.EXPAND | wx.ALL, 10)
 
         btnSizer = wx.BoxSizer(wx.HORIZONTAL)
         viewBtn = wx.Button(self, label=_("&View Full Translation"))
-        closeBtn = wx.Button(self, wx.ID_CLOSE, label=_("&Close"))
+        closeBtn = wx.Button(self, wx.ID_CANCEL, label=_("&Close"))
         viewBtn.Bind(wx.EVT_BUTTON, self.onView)
-        closeBtn.Bind(wx.EVT_BUTTON, lambda evt: self.Close())
+        closeBtn.Bind(wx.EVT_BUTTON, self.onClose)
+        viewBtn.SetDefault()
 
         btnSizer.Add(viewBtn, 0, wx.RIGHT, 5)
         btnSizer.Add(closeBtn, 0)
@@ -458,16 +510,116 @@ class HistoryDialog(wx.Dialog):
         self.SetSize((580, 420))
         self.CenterOnScreen()
         self.listBox.SetFocus()
+        self.Bind(wx.EVT_CHAR_HOOK, self.onCharHook)
+
+    def onCharHook(self, evt):
+        if evt.GetKeyCode() == wx.WXK_ESCAPE:
+            self.onClose(evt)
+        else:
+            evt.Skip()
+
+    def onListKeyDown(self, evt):
+        if evt.GetKeyCode() in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER):
+            self.onView(evt)
+        elif evt.GetKeyCode() == wx.WXK_ESCAPE:
+            self.onClose(evt)
+        else:
+            evt.Skip()
+
+    def onClose(self, evt=None):
+        if self.IsModal():
+            self.EndModal(wx.ID_CANCEL)
+        else:
+            self.Destroy()
 
     def onView(self, evt):
         sel = self.listBox.GetSelection()
-        if sel != wx.NOT_FOUND and self.history:
+        if sel != wx.NOT_FOUND and self.history and 0 <= sel < len(self.history):
             entry = self.history[sel]
             full_text = f"{_('Source')} [{entry.get('from', '?')}]:\n{entry.get('original', '')}\n\n{_('Translation')} [{entry.get('to', '?')}]:\n{entry.get('translated', '')}"
             d = ResultViewerDialog(self, full_text)
             d.ShowModal()
             d.Destroy()
-            self.Close()
+
+
+class QuickSlotsDialog(wx.Dialog):
+    def __init__(self, parent, slot_type="target", current_slots=None, lang_keys=None, lang_names=None):
+        if slot_type == "target":
+            title = _("OmniTranslate - Target Language Quick Keys")
+        else:
+            title = _("OmniTranslate - Source Language Quick Keys")
+        super(QuickSlotsDialog, self).__init__(
+            parent,
+            title=title,
+            style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER
+        )
+        self.slot_type = slot_type
+        self.current_slots = current_slots or {}
+        
+        self.lang_keys = lang_keys if lang_keys is not None else _CLEAN_ALL_LANG_KEYS
+        self.lang_names = lang_names if lang_names is not None else _CLEAN_ALL_LANG_NAMES
+        self.slot_keys = ["none"] + self.lang_keys
+        self.slot_names = [_("Please select a language")] + self.lang_names
+
+        mainSizer = wx.BoxSizer(wx.VERTICAL)
+        
+        if slot_type == "target":
+            desc_text = _("Assign languages to Target Quick Slots 1 - 10 (Press keys 1 - 0 in Layer mode to translate instantly):")
+        else:
+            desc_text = _("Assign languages to Source Quick Slots 1 - 10 (Press keys Shift+1 - Shift+0 in Layer mode to switch source language):")
+        descLabel = wx.StaticText(self, label=desc_text)
+        mainSizer.Add(descLabel, 0, wx.ALL, 10)
+
+        # Scrolled window to ensure smooth layout on any screen resolution / DPI
+        scroller = wx.ScrolledWindow(self, style=wx.VSCROLL)
+        scroller.SetScrollRate(0, 20)
+        gridSizer = wx.FlexGridSizer(rows=10, cols=2, vgap=8, hgap=12)
+        gridSizer.AddGrowableCol(1, 1)
+
+        self.slotControls = []
+        for i in range(1, 11):
+            key_num = "0" if i == 10 else str(i)
+            if slot_type == "target":
+                label_str = _("Target Slot {slot} (Key {key}):").format(slot=i, key=key_num)
+            else:
+                label_str = _("Source Slot {slot} (Key Shift+{key}):").format(slot=i, key=key_num)
+
+            lbl = wx.StaticText(scroller, label=label_str)
+            ctrl = wx.Choice(scroller, choices=self.slot_names)
+            
+            if slot_type == "target":
+                cur_val = self.current_slots.get(f"targetQuickSlot{i}", self.current_slots.get(f"quickSlot{i}", "none"))
+            else:
+                cur_val = self.current_slots.get(f"sourceQuickSlot{i}", "none")
+            s_idx = self.slot_keys.index(cur_val) if cur_val in self.slot_keys else 0
+            ctrl.SetSelection(s_idx)
+
+            gridSizer.Add(lbl, 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, 5)
+            gridSizer.Add(ctrl, 1, wx.EXPAND | wx.RIGHT, 5)
+            self.slotControls.append(ctrl)
+
+        scroller.SetSizer(gridSizer)
+        mainSizer.Add(scroller, 1, wx.EXPAND | wx.LEFT | wx.RIGHT, 10)
+
+        # Dialog standard buttons (OK and Cancel)
+        btnSizer = self.CreateButtonSizer(wx.OK | wx.CANCEL)
+        if btnSizer:
+            mainSizer.Add(btnSizer, 0, wx.ALIGN_RIGHT | wx.ALL, 10)
+
+        self.SetSizer(mainSizer)
+        self.SetSize((520, 500))
+        self.CenterOnScreen()
+        if self.slotControls:
+            self.slotControls[0].SetFocus()
+
+    def getSlots(self):
+        prefix = "targetQuickSlot" if self.slot_type == "target" else "sourceQuickSlot"
+        res = {}
+        for i, ctrl in enumerate(self.slotControls, 1):
+            sel = ctrl.GetSelection()
+            val = self.slot_keys[sel] if (sel != wx.NOT_FOUND and 0 <= sel < len(self.slot_keys)) else "none"
+            res[f"{prefix}{i}"] = val
+        return res
 
 
 class OmniTranslateGeneralSettingsPanel(SettingsPanel):
@@ -510,17 +662,22 @@ class OmniTranslateGeneralSettingsPanel(SettingsPanel):
         self.srcChoice = sHelper.addLabeledControl(_("Secondary swap language:"), wx.Choice, choices=self.lang_names)
         self.srcChoice.SetSelection(src_idx)
 
-        # Quick Slots 1 - 5
-        self.slot_keys = ["none"] + self.lang_keys
-        self.slot_names = [_("Please select a language")] + self.lang_names
-        self.slotControls = []
-        for i in range(1, 6):
-            slot_key = f"quickSlot{i}"
-            cur_slot = self.cfg.get(slot_key, "none")
-            s_idx = self.slot_keys.index(cur_slot) if cur_slot in self.slot_keys else 0
-            ctrl = sHelper.addLabeledControl(_(f"Quick Slot {i}:"), wx.Choice, choices=self.slot_names)
-            ctrl.SetSelection(s_idx)
-            self.slotControls.append(ctrl)
+        # Initialize pending quick slot configurations
+        self.pendingTargetSlots = {
+            f"targetQuickSlot{i}": self.cfg.get(f"targetQuickSlot{i}", self.cfg.get(f"quickSlot{i}", "none"))
+            for i in range(1, 11)
+        }
+        self.pendingSourceSlots = {
+            f"sourceQuickSlot{i}": self.cfg.get(f"sourceQuickSlot{i}", "none")
+            for i in range(1, 11)
+        }
+
+        # Buttons to configure Target and Source Quick Keys separately
+        self.targetSlotsBtn = sHelper.addItem(wx.Button(self, label=_("Configure &Target Language Quick Keys...")))
+        self.targetSlotsBtn.Bind(wx.EVT_BUTTON, self.onConfigureTargetSlots)
+
+        self.sourceSlotsBtn = sHelper.addItem(wx.Button(self, label=_("Configure &Source Language Quick Keys...")))
+        self.sourceSlotsBtn.Bind(wx.EVT_BUTTON, self.onConfigureSourceSlots)
 
         # Smart Bidirectional Checkbox
         self.autoDetectCheck = sHelper.addItem(wx.CheckBox(self, label=_("Auto-detect input language (Smart Bidirectional)")))
@@ -538,6 +695,38 @@ class OmniTranslateGeneralSettingsPanel(SettingsPanel):
 
         self.replaceSelectionCheck = sHelper.addItem(wx.CheckBox(self, label=_("Replace selected text with translation in editable fields")))
         self.replaceSelectionCheck.SetValue(self.cfg.get("replaceSelection", False))
+
+    def onConfigureTargetSlots(self, evt):
+        def _show():
+            gui.mainFrame.prePopup()
+            d = QuickSlotsDialog(
+                self,
+                slot_type="target",
+                current_slots=self.pendingTargetSlots,
+                lang_keys=_CLEAN_ALL_LANG_KEYS,
+                lang_names=_CLEAN_ALL_LANG_NAMES
+            )
+            if d.ShowModal() == wx.ID_OK:
+                self.pendingTargetSlots.update(d.getSlots())
+            d.Destroy()
+            gui.mainFrame.postPopup()
+        wx.CallAfter(_show)
+
+    def onConfigureSourceSlots(self, evt):
+        def _show():
+            gui.mainFrame.prePopup()
+            d = QuickSlotsDialog(
+                self,
+                slot_type="source",
+                current_slots=self.pendingSourceSlots,
+                lang_keys=_CLEAN_ALL_LANG_KEYS,
+                lang_names=_CLEAN_ALL_LANG_NAMES
+            )
+            if d.ShowModal() == wx.ID_OK:
+                self.pendingSourceSlots.update(d.getSlots())
+            d.Destroy()
+            gui.mainFrame.postPopup()
+        wx.CallAfter(_show)
 
     def onModeChange(self, evt):
         sel_idx = self.modeChoice.GetSelection()
@@ -568,19 +757,12 @@ class OmniTranslateGeneralSettingsPanel(SettingsPanel):
         
         src_sel = self.srcChoice.GetSelection()
         prev_src_key = self.lang_keys[src_sel] if (self.lang_keys and 0 <= src_sel < len(self.lang_keys)) else "en"
-        
-        prev_slot_keys = []
-        for ctrl in self.slotControls:
-            sel = ctrl.GetSelection()
-            prev_slot_keys.append(self.slot_keys[sel] if (hasattr(self, "slot_keys") and 0 <= sel < len(self.slot_keys)) else "none")
 
         self.lang_map = new_lang_map
         self.lang_keys = new_lang_keys
         self.lang_names = new_lang_names
-        self.slot_keys = ["none"] + self.lang_keys
-        self.slot_names = [_("Please select a language")] + self.lang_names
 
-        all_controls = [self.tgtChoice, self.srcChoice] + self.slotControls
+        all_controls = [self.tgtChoice, self.srcChoice]
         for ctrl in all_controls:
             ctrl.Freeze()
         self.Freeze()
@@ -596,14 +778,6 @@ class OmniTranslateGeneralSettingsPanel(SettingsPanel):
             new_src_idx = self.lang_keys.index(prev_src_key) if prev_src_key in self.lang_keys else 0
             if self.lang_names and 0 <= new_src_idx < len(self.lang_names):
                 self.srcChoice.SetSelection(new_src_idx)
-
-            # Update Quick Slots
-            for i, ctrl in enumerate(self.slotControls):
-                ctrl.Set(self.slot_names)
-                prev_slot = prev_slot_keys[i] if i < len(prev_slot_keys) else "none"
-                new_slot_idx = self.slot_keys.index(prev_slot) if prev_slot in self.slot_keys else 0
-                if self.slot_names and 0 <= new_slot_idx < len(self.slot_names):
-                    ctrl.SetSelection(new_slot_idx)
         finally:
             self.Thaw()
             for ctrl in all_controls:
@@ -628,10 +802,13 @@ class OmniTranslateGeneralSettingsPanel(SettingsPanel):
         if src_sel != wx.NOT_FOUND and 0 <= src_sel < len(self.lang_keys):
             updates["sourceLang"] = self.lang_keys[src_sel]
 
-        for i, ctrl in enumerate(self.slotControls, 1):
-            s_sel = ctrl.GetSelection()
-            if s_sel != wx.NOT_FOUND and 0 <= s_sel < len(self.slot_keys):
-                updates[f"quickSlot{i}"] = self.slot_keys[s_sel]
+        # Save separate Target and Source Quick Slots
+        if hasattr(self, "pendingTargetSlots"):
+            updates.update(self.pendingTargetSlots)
+            for i in range(1, 11):
+                updates[f"quickSlot{i}"] = self.pendingTargetSlots.get(f"targetQuickSlot{i}", "none")
+        if hasattr(self, "pendingSourceSlots"):
+            updates.update(self.pendingSourceSlots)
 
         save_config(updates)
 
@@ -701,10 +878,14 @@ class OmniTranslateOfflineModelsPanel(SettingsPanel):
             self.modelInfoText.SetLabel(_("Model type: Single Language Pair ({src} -> {tgt} only)").format(src=s_name, tgt=t_name))
 
     def onOpenFolder(self, evt):
+        if getattr(globalVars.appArgs, "secureMode", False):
+            ui.message(_("Explorer cannot be opened on secure screens."))
+            return
         try:
             os.startfile(offlineEngine.MODELS_DIR)
         except Exception as e:
             logHandler.log.error(f"OmniTranslate: Could not open folder: {e}")
+            ui.message(_("Could not open models folder."))
 
     def onDownload(self, evt):
         sel_idx = self.catalogChoice.GetSelection()

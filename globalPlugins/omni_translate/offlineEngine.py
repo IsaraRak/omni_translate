@@ -2124,30 +2124,55 @@ OFFLINE_MODELS_CATALOG = RECOMMENDED_MODELS
 
 
 def get_installed_offline_models():
-    """Returns a list of folder names for installed models."""
+    """Returns a list of folder names for valid installed models."""
     installed = []
     if os.path.exists(MODELS_DIR):
         for item in os.listdir(MODELS_DIR):
             item_path = os.path.join(MODELS_DIR, item)
             if os.path.isdir(item_path):
-                installed.append(item)
+                # Ensure directory contains valid model weights
+                if os.path.isfile(os.path.join(item_path, "model.bin")):
+                    installed.append(item)
         installed.sort()
     return installed
 
 
 def delete_installed_model(model_id):
     """Deletes an installed model directory."""
-    _MODEL_LANG_CACHE.pop(model_id, None)
-    model_dir = os.path.join(MODELS_DIR, model_id)
+    if not model_id or not isinstance(model_id, str):
+        return False
+    clean_id = model_id.strip()
+    if not re.match(r'^[a-zA-Z0-9_\.-]+$', clean_id) or ".." in clean_id or "/" in clean_id or "\\" in clean_id:
+        logHandler.log.error(f"OmniTranslate: Refusing to delete model with invalid or dangerous ID: {model_id}")
+        return False
+
+    models_dir_abs = os.path.abspath(MODELS_DIR)
+    model_dir = os.path.abspath(os.path.join(MODELS_DIR, clean_id))
+    if not model_dir.startswith(models_dir_abs + os.sep) or model_dir == models_dir_abs:
+        logHandler.log.error(f"OmniTranslate: Path traversal detected in delete model: {model_dir}")
+        return False
+
+    _MODEL_LANG_CACHE.pop(clean_id, None)
     if os.path.exists(model_dir):
         try:
-            shutil.rmtree(model_dir, ignore_errors=True)
             if model_dir in _LOADED_MODELS:
-                del _LOADED_MODELS[model_dir]
+                try:
+                    engine = _LOADED_MODELS.pop(model_dir, None)
+                    if engine:
+                        translator = engine.get("translator")
+                        if translator and hasattr(translator, "unload_model"):
+                            translator.unload_model()
+                        del engine
+                except Exception:
+                    pass
+                import gc
+                gc.collect()
+            shutil.rmtree(model_dir, ignore_errors=True)
             return True
         except Exception as e:
-            logHandler.log.error(f"OmniTranslate: Failed to delete model {model_id}: {e}")
+            logHandler.log.error(f"OmniTranslate: Failed to delete model {clean_id}: {e}")
             return False
+    return False
 
 
 def get_model_supported_languages(model_id):
@@ -2221,8 +2246,25 @@ def get_model_supported_languages(model_id):
 
 def download_model_package(model_info, on_complete=None):
     """Downloads CTranslate2 model package with live progress."""
-    model_id = model_info.get("id", "nllb-200-600m")
-    repo_name = model_info.get("repo", "JustFrederik/nllb-200-distilled-600M-ct2-int8")
+    if getattr(globalVars.appArgs, "secureMode", False):
+        wx.CallAfter(ui.message, _("Model download is disabled on secure screens."))
+        return
+
+    model_id = str(model_info.get("id", "nllb-200-600m")).strip()
+    if not re.match(r'^[a-zA-Z0-9_\.-]+$', model_id) or ".." in model_id or "/" in model_id or "\\" in model_id:
+        logHandler.log.error(f"OmniTranslate: Invalid model ID for download: {model_id}")
+        return
+
+    models_dir_abs = os.path.abspath(MODELS_DIR)
+    target_dir = os.path.abspath(os.path.join(MODELS_DIR, model_id))
+    if not target_dir.startswith(models_dir_abs + os.sep):
+        logHandler.log.error(f"OmniTranslate: Path traversal detected in target_dir: {target_dir}")
+        return
+
+    repo_name = str(model_info.get("repo", "JustFrederik/nllb-200-distilled-600M-ct2-int8")).strip()
+    if not re.match(r'^[a-zA-Z0-9_\.-]+/[a-zA-Z0-9_\.-]+$', repo_name) or ".." in repo_name:
+        logHandler.log.error(f"OmniTranslate: Invalid repo name for download: {repo_name}")
+        return
     base_url = f"https://huggingface.co/{repo_name}/resolve/main/"
 
     files_to_download = [
@@ -2238,7 +2280,6 @@ def download_model_package(model_info, on_complete=None):
 
     def _worker():
         try:
-            target_dir = os.path.join(MODELS_DIR, model_id)
             if not os.path.exists(target_dir):
                 os.makedirs(target_dir)
 
@@ -2263,7 +2304,8 @@ def download_model_package(model_info, on_complete=None):
                         file_done = 0
                         last_pct = 0
 
-                        with open(dest_path, "wb") as out_file:
+                        part_path = dest_path + ".part"
+                        with open(part_path, "wb") as out_file:
                             while True:
                                 chunk = res.read(1024 * 512)
                                 if not chunk:
@@ -2279,20 +2321,28 @@ def download_model_package(model_info, on_complete=None):
                                         done_mb = file_done / (1024 * 1024)
                                         total_mb = file_total / (1024 * 1024)
                                         msg = _("Downloading {name}: {pct}% ({done_mb:.1f} MB / {total_mb:.1f} MB)").format(
-                                            name=model_info["name"],
-                                            pct=pct,
-                                            done_mb=done_mb,
-                                            total_mb=total_mb
-                                        )
+                                             name=model_info["name"],
+                                             pct=pct,
+                                             done_mb=done_mb,
+                                             total_mb=total_mb
+                                         )
                                         wx.CallAfter(ui.message, msg)
+                        os.replace(part_path, dest_path)
                 except urllib.error.HTTPError as he:
                     if is_required:
                         raise he
-                    continue
                 except Exception as e:
                     if is_required:
                         raise e
                     continue
+
+            # Verify that essential model files (model.bin and at least one tokenizer) were downloaded successfully
+            has_tokenizer = any(
+                os.path.isfile(os.path.join(target_dir, sp_name))
+                for sp_name in ("source.spm", "spm.model", "sentencepiece.bpe.model", "opus.spm")
+            )
+            if not os.path.isfile(os.path.join(target_dir, "model.bin")) or not has_tokenizer:
+                raise Exception(_("Model package is incomplete: missing weights or tokenizer."))
 
             with open(os.path.join(target_dir, "model_info.json"), "w", encoding="utf-8") as f:
                 json.dump(model_info, f, ensure_ascii=False, indent=2)
@@ -2311,6 +2361,12 @@ def download_model_package(model_info, on_complete=None):
 
         except Exception as e:
             logHandler.log.error(f"OmniTranslate: Error downloading model: {e}")
+            # Clean up incomplete model folder so corrupted weights are not loaded
+            if not os.path.exists(os.path.join(target_dir, "model.bin")):
+                try:
+                    shutil.rmtree(target_dir, ignore_errors=True)
+                except Exception:
+                    pass
             err_msg = _("Model download failed: {error}").format(error=str(e))
             wx.CallAfter(ui.message, err_msg)
 
