@@ -28,6 +28,14 @@ ALLOWED_UPDATE_HOSTS = (
 )
 
 
+# Ensure backward compatibility alias for installAddonBundle
+if hasattr(addonHandler, "installAddonBundle") and not hasattr(addonHandler, "installAddonPackage"):
+    try:
+        addonHandler.installAddonPackage = addonHandler.installAddonBundle
+    except Exception:
+        pass
+
+
 def parse_version(v_str):
     """Extracts tuple of integers from version string (e.g., '2026.4' -> (2026, 4))."""
     if not v_str:
@@ -146,8 +154,62 @@ def _download_and_install(download_url, latest_version):
 
         def _do_install():
             try:
-                bundle = addonHandler.AddonBundle(temp_addon_path)
-                addonHandler.installAddonPackage(bundle)
+                installed = False
+
+                # Priority 1: Use NVDA's official remote installer dialog
+                try:
+                    import gui.addonGui
+                    if hasattr(gui.addonGui, "handleRemoteAddonInstall"):
+                        gui.addonGui.handleRemoteAddonInstall(temp_addon_path)
+                        installed = True
+                    elif hasattr(gui.addonGui, "installAddon"):
+                        gui.mainFrame.prePopup()
+                        try:
+                            if gui.addonGui.installAddon(gui.mainFrame, temp_addon_path):
+                                promptUserForRestart = getattr(gui.addonGui, "promptUserForRestart", None)
+                                if promptUserForRestart:
+                                    wx.CallAfter(promptUserForRestart)
+                            installed = True
+                        finally:
+                            gui.mainFrame.postPopup()
+                except Exception as gui_err:
+                    logHandler.log.debug(f"OmniTranslate: gui.addonGui installation fallback: {gui_err}")
+
+                # Priority 2: Direct addonHandler bundle installation (headless / robust fallback)
+                if not installed:
+                    bundle = addonHandler.AddonBundle(temp_addon_path)
+                    install_fn = getattr(addonHandler, "installAddonBundle", None) or getattr(addonHandler, "installAddonPackage", None)
+                    if not install_fn:
+                        raise AttributeError("Neither installAddonBundle nor installAddonPackage found in addonHandler")
+
+                    install_fn(bundle)
+
+                    # Request removal of previous version
+                    try:
+                        for prev in addonHandler.getAvailableAddons():
+                            if prev.name == "omni_translate":
+                                prev.requestRemove()
+                                break
+                    except Exception as rm_err:
+                        logHandler.log.debug(f"OmniTranslate: prevAddon requestRemove error: {rm_err}")
+
+                    # Prompt user to restart NVDA
+                    try:
+                        import gui.addonGui
+                        promptUserForRestart = getattr(gui.addonGui, "promptUserForRestart", None)
+                        if promptUserForRestart:
+                            wx.CallAfter(promptUserForRestart)
+                        else:
+                            gui.messageBox(
+                                _("OmniTranslate has been updated successfully.\nPlease restart NVDA for changes to take effect."),
+                                _("OmniTranslate Update"),
+                                wx.OK | wx.ICON_INFORMATION,
+                                gui.mainFrame
+                            )
+                    except Exception:
+                        ui.message(_("OmniTranslate updated. Please restart NVDA."))
+                    installed = True
+
             except Exception as inst_err:
                 logHandler.log.error(f"OmniTranslate: Installation failed: {inst_err}")
                 ui.message(f"{_('OmniTranslate Update Error:')} {inst_err}")

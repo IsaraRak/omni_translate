@@ -32,6 +32,13 @@ from . import updateChecker
 
 addonHandler.initTranslation()
 
+# Ensure backward compatibility alias for installAddonBundle
+if hasattr(addonHandler, "installAddonBundle") and not hasattr(addonHandler, "installAddonPackage"):
+    try:
+        addonHandler.installAddonPackage = addonHandler.installAddonBundle
+    except Exception:
+        pass
+
 
 def normalize_lang(code):
     if isinstance(code, list):
