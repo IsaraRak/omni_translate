@@ -609,8 +609,15 @@ class QuickSlotsDialog(wx.Dialog):
         self.SetSizer(mainSizer)
         self.SetSize((520, 500))
         self.CenterOnScreen()
+        self.Bind(wx.EVT_CHAR_HOOK, self.onCharHook)
         if self.slotControls:
             self.slotControls[0].SetFocus()
+
+    def onCharHook(self, evt):
+        if evt.GetKeyCode() == wx.WXK_ESCAPE:
+            self.EndModal(wx.ID_CANCEL)
+        else:
+            evt.Skip()
 
     def getSlots(self):
         prefix = "targetQuickSlot" if self.slot_type == "target" else "sourceQuickSlot"
