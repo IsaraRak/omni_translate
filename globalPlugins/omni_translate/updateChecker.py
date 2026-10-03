@@ -23,7 +23,9 @@ GITHUB_REPO = "IsaraRak/omni_translate"
 API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 ALLOWED_UPDATE_HOSTS = (
     "github.com",
+    "githubusercontent.com",
     "objects.githubusercontent.com",
+    "release-assets.githubusercontent.com",
     "raw.githubusercontent.com"
 )
 
@@ -50,10 +52,10 @@ def get_current_addon_version():
     try:
         cur_addon = addonHandler.getCodeAddon()
         if cur_addon and cur_addon.manifest:
-            return cur_addon.manifest.get("version", "2026.4")
+            return cur_addon.manifest.get("version", "2026.5")
     except Exception:
         pass
-    return "2026.4"
+    return "2026.5"
 
 
 def is_safe_download_url(url):
@@ -70,7 +72,7 @@ def is_safe_download_url(url):
 
 def check_for_updates_background():
     """Runs in a background thread to check GitHub for the latest release."""
-    if getattr(globalVars.appArgs, "secureMode", False):
+    if getattr(globalVars.appArgs, "secure", False) or getattr(globalVars.appArgs, "secureMode", False):
         return
 
     try:
@@ -131,7 +133,7 @@ def _prompt_user_to_update(latest_version, download_url):
 
 def _download_and_install(download_url, latest_version):
     """Downloads the .nvda-addon bundle and invokes NVDA addonHandler installer."""
-    if getattr(globalVars.appArgs, "secureMode", False):
+    if getattr(globalVars.appArgs, "secure", False) or getattr(globalVars.appArgs, "secureMode", False):
         return
 
     temp_addon_path = None
@@ -150,9 +152,14 @@ def _download_and_install(download_url, latest_version):
         )
         with urllib.request.urlopen(req, timeout=30.0) as resp:
             with open(temp_addon_path, "wb") as f_out:
-                f_out.write(resp.read())
+                while True:
+                    chunk = resp.read(64 * 1024)
+                    if not chunk:
+                        break
+                    f_out.write(chunk)
 
         def _do_install():
+            nonlocal temp_addon_path
             try:
                 installed = False
 
@@ -162,6 +169,8 @@ def _download_and_install(download_url, latest_version):
                     if hasattr(gui.addonGui, "handleRemoteAddonInstall"):
                         gui.addonGui.handleRemoteAddonInstall(temp_addon_path)
                         installed = True
+                        # Handed off to NVDA's modeless installer dialog; do not delete temp file
+                        temp_addon_path = None
                     elif hasattr(gui.addonGui, "installAddon"):
                         gui.mainFrame.prePopup()
                         try:
@@ -182,16 +191,15 @@ def _download_and_install(download_url, latest_version):
                     if not install_fn:
                         raise AttributeError("Neither installAddonBundle nor installAddonPackage found in addonHandler")
 
-                    install_fn(bundle)
-
-                    # Request removal of previous version
                     try:
-                        for prev in addonHandler.getAvailableAddons():
-                            if prev.name == "omni_translate":
-                                prev.requestRemove()
-                                break
-                    except Exception as rm_err:
-                        logHandler.log.debug(f"OmniTranslate: prevAddon requestRemove error: {rm_err}")
+                        install_fn(bundle)
+                    finally:
+                        if hasattr(bundle, "close"):
+                            try:
+                                bundle.close()
+                            except Exception:
+                                pass
+                        del bundle
 
                     # Prompt user to restart NVDA
                     try:
@@ -234,7 +242,7 @@ def _download_and_install(download_url, latest_version):
 
 def start_update_checker_service():
     """Initializes the background update checker with a startup delay."""
-    if getattr(globalVars.appArgs, "secureMode", False):
+    if getattr(globalVars.appArgs, "secure", False) or getattr(globalVars.appArgs, "secureMode", False):
         logHandler.log.debug("OmniTranslate: Update checker skipped on secure desktop.")
         return
     wx.CallLater(10000, lambda: threading.Thread(target=check_for_updates_background, daemon=True).start())

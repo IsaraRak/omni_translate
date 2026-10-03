@@ -17,6 +17,13 @@ def onUninstall():
             logHandler.log.info("OmniTranslate: Update in progress. Preserving configuration and offline models.")
             return
 
+        # Safely unload any running neural models from RAM to release Windows file locks
+        try:
+            from globalPlugins.omni_translate import offlineEngine
+            offlineEngine.unload_all_models()
+        except Exception:
+            pass
+
         models_dir = os.path.join(globalVars.appArgs.configPath, "omni_translate_models")
         if os.path.exists(models_dir):
             shutil.rmtree(models_dir, ignore_errors=True)

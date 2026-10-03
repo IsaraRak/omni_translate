@@ -15,11 +15,16 @@ def getDocFilePath(fileName):
     langDir = os.path.join(baseDir, lang)
     if os.path.exists(os.path.join(langDir, fileName)):
         return os.path.join(langDir, fileName)
+    if "_" in lang:
+        shortLang = lang.split("_")[0]
+        shortDir = os.path.join(baseDir, shortLang)
+        if os.path.exists(os.path.join(shortDir, fileName)):
+            return os.path.join(shortDir, fileName)
     return os.path.join(baseDir, "en", fileName)
 
 
 def openDoc():
-    if getattr(globalVars.appArgs, "secureMode", False):
+    if getattr(globalVars.appArgs, "secure", False) or getattr(globalVars.appArgs, "secureMode", False):
         ui.message(_("Documentation cannot be opened on secure screens."))
         return
 

@@ -8,7 +8,9 @@ import re
 import json
 import shutil
 import threading
+import time
 import unicodedata
+import difflib
 from collections import defaultdict
 import urllib.request
 import urllib.error
@@ -71,6 +73,8 @@ if os.path.exists(ARCH_LIB_DIR):
 
 _LOADED_MODELS = {}
 _MODEL_LANG_CACHE = {}
+_ENGINE_LOCK = threading.RLock()
+_ACTIVE_TRANSLATIONS = defaultdict(int)
 
 LATIN_LANGS = {
     "en", "pt", "es", "fr", "de", "it", "nl", "id", "ms", "tl", "vi", "sv", "da", "fi", "no", "pl", "tr", "cs", "ro", "hu", "af", "sq", "ca", "hr", "et", "lv", "lt", "sk", "sl"
@@ -1726,6 +1730,9 @@ RAW_VOCAB = {
 }
 
 VOCAB_UNACCENTED = {lang: {normalize_unaccented(w) for w in words} for lang, words in RAW_VOCAB.items()}
+del RAW_VOCAB
+import gc as _gc
+_gc.collect()
 
 
 def detect_text_language(text, hint_langs=None):
@@ -1872,6 +1879,8 @@ def detect_text_language(text, hint_langs=None):
         for h in clean_hints:
             if h in counts and counts[h] > 0:
                 counts[h] += 2
+            elif h == "zh" and "zh-cn" in counts and counts["zh-cn"] > 0:
+                counts["zh-cn"] += 2
 
     if counts:
         best_lang = max(counts, key=counts.get)
@@ -2109,14 +2118,27 @@ RECOMMENDED_MODELS = [
         "name": _("NLLB-200 Standard (600M - Fast ~600 MB)"),
         "repo": "JustFrederik/nllb-200-distilled-600M-ct2-int8",
         "approx_size_mb": 600,
-        "is_multilingual": True
+        "is_multilingual": True,
+        "model_type": "nllb",
+        "min_specs": _("Minimum Specs: 4 GB RAM, Dual-Core CPU")
     },
     {
         "id": "nllb-200-1.3b",
         "name": _("NLLB-200 High Quality (1.3B - Enhanced Accuracy ~1.3 GB)"),
         "repo": "JustFrederik/nllb-200-distilled-1.3B-ct2-int8",
         "approx_size_mb": 1300,
-        "is_multilingual": True
+        "is_multilingual": True,
+        "model_type": "nllb",
+        "min_specs": _("Minimum Specs: 8 GB RAM, Quad-Core CPU")
+    },
+    {
+        "id": "google-madlad400-3b",
+        "name": _("Google MADLAD-400 (3B - Ultra Multilingual ~2.9 GB)"),
+        "repo": "Heng666/madlad400-3b-mt-ct2-int8",
+        "approx_size_mb": 2950,
+        "is_multilingual": True,
+        "model_type": "madlad",
+        "min_specs": _("Minimum Specs: 16 GB RAM, 4-core AVX2 CPU")
     }
 ]
 
@@ -2137,6 +2159,179 @@ def get_installed_offline_models():
     return installed
 
 
+def _normalize_model_path(path):
+    """Normalizes model directory path for consistent cache lookups and cross-platform safety."""
+    if not path or not isinstance(path, str):
+        return ""
+    return os.path.normcase(os.path.abspath(os.path.normpath(path)))
+
+
+def unload_engine(model_dir=None):
+    """Unloads and frees memory for a specific model, or all loaded models if model_dir is None."""
+    global _LOADED_MODELS
+    import gc
+
+    with _ENGINE_LOCK:
+        target_keys = []
+        if model_dir is None:
+            target_keys = list(_LOADED_MODELS.keys())
+        else:
+            norm_target = _normalize_model_path(model_dir)
+            for k in list(_LOADED_MODELS.keys()):
+                if _normalize_model_path(k) == norm_target:
+                    target_keys.append(k)
+
+        for k in target_keys:
+            # Prevent unloading a model currently performing inference
+            if _ACTIVE_TRANSLATIONS.get(_normalize_model_path(k), 0) > 0:
+                logHandler.log.warning(f"OmniTranslate: Skipping unload for busy model {k}")
+                continue
+
+            engine = _LOADED_MODELS.pop(k, None)
+            if engine:
+                try:
+                    translator = engine.get("translator")
+                    if translator and hasattr(translator, "unload_model"):
+                        translator.unload_model()
+                except Exception as e:
+                    logHandler.log.debug(f"OmniTranslate: Error unloading model: {e}")
+                finally:
+                    translator = None
+                try:
+                    engine.clear()
+                except Exception:
+                    pass
+                del engine
+
+        gc.collect()
+
+
+def unload_all_models():
+    """Public API to unload all loaded models from memory and trigger garbage collection."""
+    unload_engine(None)
+
+
+# ----------------------------------------------------------------------
+# 10-Minute Online Mode Idle Memory Auto-Reclaim Engine
+# ----------------------------------------------------------------------
+_ONLINE_IDLE_TIMEOUT_SECONDS = 600.0  # 10 minutes
+_online_idle_timer = None
+_last_offline_use_time = 0.0
+_IDLE_TIMER_LOCK = threading.Lock()
+
+
+def record_offline_activity():
+    """Records timestamp of offline model activity and resets the 10-minute idle timer if in Online mode."""
+    global _last_offline_use_time
+    with _IDLE_TIMER_LOCK:
+        _last_offline_use_time = time.time()
+    _check_and_schedule_idle_reclaim()
+
+
+def _check_and_schedule_idle_reclaim():
+    """Schedules or resets the 10-minute idle unload timer if in Online mode with loaded models."""
+    global _online_idle_timer
+    with _IDLE_TIMER_LOCK:
+        if _online_idle_timer is not None:
+            try:
+                _online_idle_timer.cancel()
+            except Exception:
+                pass
+            _online_idle_timer = None
+
+        try:
+            from . import settingsDialogs
+            mode = settingsDialogs.load_config().get("translationMode", "online")
+        except Exception:
+            mode = "online"
+
+        if mode != "online":
+            return
+
+        with _ENGINE_LOCK:
+            has_loaded = len(_LOADED_MODELS) > 0
+
+        if not has_loaded:
+            return
+
+        _online_idle_timer = threading.Timer(_ONLINE_IDLE_TIMEOUT_SECONDS, _on_online_idle_timeout)
+        _online_idle_timer.daemon = True
+        _online_idle_timer.start()
+
+
+def _on_online_idle_timeout():
+    """Fires after 10 minutes of inactivity in Online mode to free offline models from RAM."""
+    global _online_idle_timer
+    with _IDLE_TIMER_LOCK:
+        _online_idle_timer = None
+
+    try:
+        from . import settingsDialogs
+        mode = settingsDialogs.load_config().get("translationMode", "online")
+    except Exception:
+        mode = "online"
+
+    if mode != "online":
+        return
+
+    now = time.time()
+    with _IDLE_TIMER_LOCK:
+        elapsed = now - _last_offline_use_time
+        if elapsed < _ONLINE_IDLE_TIMEOUT_SECONDS - 5.0:
+            remaining = max(5.0, _ONLINE_IDLE_TIMEOUT_SECONDS - elapsed)
+            _online_idle_timer = threading.Timer(remaining, _on_online_idle_timeout)
+            _online_idle_timer.daemon = True
+            _online_idle_timer.start()
+            return
+
+    reschedule_busy = False
+    with _ENGINE_LOCK:
+        any_busy = any(count > 0 for count in _ACTIVE_TRANSLATIONS.values())
+        if any_busy:
+            reschedule_busy = True
+        else:
+            has_models = len(_LOADED_MODELS) > 0
+            if has_models:
+                unload_all_models()
+                logHandler.log.info("OmniTranslate: 10 minutes of inactivity in Online Mode reached. Offline neural models successfully unloaded from RAM to free system memory.")
+
+    if reschedule_busy:
+        with _IDLE_TIMER_LOCK:
+            _online_idle_timer = threading.Timer(60.0, _on_online_idle_timeout)
+            _online_idle_timer.daemon = True
+            _online_idle_timer.start()
+
+
+def cancel_online_idle_timer():
+    """Cancels any running online idle reclaim timer (e.g. when switching to Offline mode)."""
+    global _online_idle_timer
+    with _IDLE_TIMER_LOCK:
+        if _online_idle_timer is not None:
+            try:
+                _online_idle_timer.cancel()
+            except Exception:
+                pass
+            _online_idle_timer = None
+
+
+def on_mode_changed(new_mode):
+    """Called when user switches translation mode (Online vs Offline)."""
+    if new_mode == "online":
+        _check_and_schedule_idle_reclaim()
+    else:
+        cancel_online_idle_timer()
+
+
+def is_model_busy(model_id):
+    """Checks if an installed offline model is currently executing active translation."""
+    if not model_id or not isinstance(model_id, str):
+        return False
+    clean_id = model_id.strip()
+    norm_dir = _normalize_model_path(os.path.join(MODELS_DIR, clean_id))
+    with _ENGINE_LOCK:
+        return _ACTIVE_TRANSLATIONS.get(norm_dir, 0) > 0
+
+
 def delete_installed_model(model_id):
     """Deletes an installed model directory."""
     if not model_id or not isinstance(model_id, str):
@@ -2152,23 +2347,24 @@ def delete_installed_model(model_id):
         logHandler.log.error(f"OmniTranslate: Path traversal detected in delete model: {model_dir}")
         return False
 
+    norm_dir = _normalize_model_path(model_dir)
+
+    # If translation is actively running on this model, refuse deletion immediately to prevent file corruption
+    with _ENGINE_LOCK:
+        if _ACTIVE_TRANSLATIONS.get(norm_dir, 0) > 0:
+            logHandler.log.warning(f"OmniTranslate: Refusing to delete model {clean_id} while translation is active.")
+            return False
+
     _MODEL_LANG_CACHE.pop(clean_id, None)
     if os.path.exists(model_dir):
         try:
-            if model_dir in _LOADED_MODELS:
-                try:
-                    engine = _LOADED_MODELS.pop(model_dir, None)
-                    if engine:
-                        translator = engine.get("translator")
-                        if translator and hasattr(translator, "unload_model"):
-                            translator.unload_model()
-                        del engine
-                except Exception:
-                    pass
-                import gc
-                gc.collect()
-            shutil.rmtree(model_dir, ignore_errors=True)
-            return True
+            unload_engine(model_dir)
+            for _attempt in range(5):
+                shutil.rmtree(model_dir, ignore_errors=True)
+                if not os.path.exists(model_dir):
+                    break
+                time.sleep(0.05)
+            return not os.path.exists(model_dir)
         except Exception as e:
             logHandler.log.error(f"OmniTranslate: Failed to delete model {clean_id}: {e}")
             return False
@@ -2193,9 +2389,10 @@ def get_model_supported_languages(model_id):
         try:
             with open(info_file, "r", encoding="utf-8") as f:
                 info = json.load(f)
-            if info.get("is_multilingual", False) or "nllb" in model_id.lower():
+            if info.get("is_multilingual", False) or "nllb" in model_id.lower() or "madlad" in model_id.lower():
                 all_langs = list(NLLB_LANG_MAP.keys())
-                res = {"src": all_langs, "tgt": all_langs, "is_multilingual": True}
+                m_type = info.get("model_type", "madlad" if "madlad" in model_id.lower() else "nllb")
+                res = {"src": all_langs, "tgt": all_langs, "is_multilingual": True, "model_type": m_type}
             else:
                 src = info.get("from", "").lower()
                 tgt = info.get("to", "").lower()
@@ -2214,7 +2411,11 @@ def get_model_supported_languages(model_id):
                         sample = vf.read(4096)
                         if "tha_Thai" in sample or "eng_Latn" in sample or "zho_Hans" in sample:
                             all_langs = list(NLLB_LANG_MAP.keys())
-                            res = {"src": all_langs, "tgt": all_langs, "is_multilingual": True}
+                            res = {"src": all_langs, "tgt": all_langs, "is_multilingual": True, "model_type": "nllb"}
+                            break
+                        elif "<2th>" in sample or "<2en>" in sample or "<2es>" in sample:
+                            all_langs = list(NLLB_LANG_MAP.keys())
+                            res = {"src": all_langs, "tgt": all_langs, "is_multilingual": True, "model_type": "madlad"}
                             break
                 except Exception:
                     pass
@@ -2222,9 +2423,10 @@ def get_model_supported_languages(model_id):
     # 3. Check Multilingual indicators in folder name
     if res is None:
         lower_id = model_id.lower()
-        if any(k in lower_id for k in ("nllb", "m2m", "multilingual", "flores")):
+        if any(k in lower_id for k in ("nllb", "madlad", "m2m", "multilingual", "flores")):
             all_langs = list(NLLB_LANG_MAP.keys())
-            res = {"src": all_langs, "tgt": all_langs, "is_multilingual": True}
+            m_type = "madlad" if "madlad" in lower_id else "nllb"
+            res = {"src": all_langs, "tgt": all_langs, "is_multilingual": True, "model_type": m_type}
 
     # 4. Check bilingual pair pattern in folder name (e.g., en-th, opus-mt-en-th, marian_de_en, th_ja)
     if res is None:
@@ -2246,7 +2448,7 @@ def get_model_supported_languages(model_id):
 
 def download_model_package(model_info, on_complete=None):
     """Downloads CTranslate2 model package with live progress."""
-    if getattr(globalVars.appArgs, "secureMode", False):
+    if getattr(globalVars.appArgs, "secure", False) or getattr(globalVars.appArgs, "secureMode", False):
         wx.CallAfter(ui.message, _("Model download is disabled on secure screens."))
         return
 
@@ -2274,6 +2476,8 @@ def download_model_package(model_info, on_complete=None):
         ("sentencepiece.bpe.model", False),
         ("source.spm", False),
         ("spm.model", False),
+        ("spiece.model", False),
+        ("sentencepiece.model", False),
         ("opus.spm", False),
         ("model.bin", True)
     ]
@@ -2339,7 +2543,7 @@ def download_model_package(model_info, on_complete=None):
             # Verify that essential model files (model.bin and at least one tokenizer) were downloaded successfully
             has_tokenizer = any(
                 os.path.isfile(os.path.join(target_dir, sp_name))
-                for sp_name in ("source.spm", "spm.model", "sentencepiece.bpe.model", "opus.spm")
+                for sp_name in ("source.spm", "spm.model", "sentencepiece.bpe.model", "spiece.model", "sentencepiece.model", "opus.spm")
             )
             if not os.path.isfile(os.path.join(target_dir, "model.bin")) or not has_tokenizer:
                 raise Exception(_("Model package is incomplete: missing weights or tokenizer."))
@@ -2348,6 +2552,7 @@ def download_model_package(model_info, on_complete=None):
                 json.dump(model_info, f, ensure_ascii=False, indent=2)
 
             total_mb = total_downloaded_bytes / (1024 * 1024)
+            logHandler.log.info(f"OmniTranslate: Model '{model_id}' successfully downloaded and verified ({total_mb:.1f} MB).")
             wx.CallAfter(tones.beep, 880, 50)
             wx.CallAfter(ui.message, _("Installation complete: {name} ({total_mb:.1f} MB) is ready.").format(
                 name=model_info["name"],
@@ -2362,11 +2567,10 @@ def download_model_package(model_info, on_complete=None):
         except Exception as e:
             logHandler.log.error(f"OmniTranslate: Error downloading model: {e}")
             # Clean up incomplete model folder so corrupted weights are not loaded
-            if not os.path.exists(os.path.join(target_dir, "model.bin")):
-                try:
-                    shutil.rmtree(target_dir, ignore_errors=True)
-                except Exception:
-                    pass
+            try:
+                shutil.rmtree(target_dir, ignore_errors=True)
+            except Exception:
+                pass
             err_msg = _("Model download failed: {error}").format(error=str(e))
             wx.CallAfter(ui.message, err_msg)
 
@@ -2374,41 +2578,275 @@ def download_model_package(model_info, on_complete=None):
 
 
 def get_loaded_engine(model_dir):
-    """Loads and caches CTranslate2 engine and SentencePiece tokenizer."""
-    if model_dir in _LOADED_MODELS:
-        return _LOADED_MODELS[model_dir]
+    """Loads and caches CTranslate2 engine and SentencePiece tokenizer.
+    Enforces a single-active-model policy to prevent multiple gigabytes of neural weights
+    from accumulating in NVDA's process memory."""
+    norm_dir = _normalize_model_path(model_dir)
+    if not norm_dir:
+        return None
 
-    try:
-        import ctranslate2
-        import sentencepiece as spm
+    with _ENGINE_LOCK:
+        if norm_dir in _LOADED_MODELS:
+            return _LOADED_MODELS[norm_dir]
 
-        sp_path = None
-        for name in ("source.spm", "spm.model", "sentencepiece.bpe.model", "opus.spm"):
-            candidate = os.path.join(model_dir, name)
-            if os.path.exists(candidate):
-                sp_path = candidate
-                break
+        # Enforce single active model in RAM: unload any previously loaded model before loading a new one
+        for loaded_path in list(_LOADED_MODELS.keys()):
+            if loaded_path != norm_dir:
+                if _ACTIVE_TRANSLATIONS.get(_normalize_model_path(loaded_path), 0) <= 0:
+                    unload_engine(loaded_path)
 
-        if not sp_path:
-            logHandler.log.error(f"OmniTranslate: No tokenizer file found in {model_dir}")
+        try:
+            import ctranslate2
+            import sentencepiece as spm
+
+            sp_path = None
+            for name in ("source.spm", "spm.model", "sentencepiece.bpe.model", "spiece.model", "sentencepiece.model", "opus.spm"):
+                candidate = os.path.join(model_dir, name)
+                if os.path.exists(candidate):
+                    sp_path = candidate
+                    break
+
+            if not sp_path:
+                logHandler.log.error(f"OmniTranslate: No tokenizer file found in {model_dir}")
+                return None
+
+            sp_processor = spm.SentencePieceProcessor(model_file=sp_path)
+            translator = ctranslate2.Translator(model_dir, device="cpu", compute_type="auto")
+
+            engine = {
+                "sp": sp_processor,
+                "translator": translator
+            }
+            _LOADED_MODELS[norm_dir] = engine
+            record_offline_activity()
+            logHandler.log.info(f"OmniTranslate: Successfully initialized neural engine for model: {os.path.basename(norm_dir)}")
+            return engine
+        except Exception as e:
+            logHandler.log.error(f"OmniTranslate: Engine initialization error: {e}")
             return None
 
-        sp_processor = spm.SentencePieceProcessor(model_file=sp_path)
-        translator = ctranslate2.Translator(model_dir, device="cpu", compute_type="auto")
 
-        engine = {
-            "sp": sp_processor,
-            "translator": translator
-        }
-        _LOADED_MODELS[model_dir] = engine
-        return engine
-    except Exception as e:
-        logHandler.log.error(f"OmniTranslate: Engine initialization error: {e}")
-        return None
+def is_cjk_char(ch):
+    if not ch:
+        return False
+    cp = ord(ch)
+    return (0x4E00 <= cp <= 0x9FFF) or (0x3040 <= cp <= 0x30FF) or (0xAC00 <= cp <= 0xD7AF)
+
+
+def get_max_consecutive_repetitions(text):
+    """Calculates maximum intentional consecutive repetitions in text across all languages."""
+    if not text or not isinstance(text, str):
+        return 1
+
+    # 1. Word-level consecutive repetition (Space-delimited languages: EN, PT, TR, ES, RU, etc.)
+    words = [w.lower() for w in re.findall(r'\b\w+\b', text, re.UNICODE)]
+    max_word_rep = 1
+    cur_rep = 1
+    for i in range(1, len(words)):
+        if words[i] == words[i - 1]:
+            cur_rep += 1
+            if cur_rep > max_word_rep:
+                max_word_rep = cur_rep
+        else:
+            cur_rep = 1
+
+    # 1.1 Multi-word phrase repetition (e.g. "wait a bit, wait a bit" / "สู้ๆ นะ สู้ๆ นะ")
+    for phrase_len in (2, 3, 4, 5):
+        if len(words) >= phrase_len * 2:
+            for i in range(len(words) - phrase_len * 2 + 1):
+                p1 = words[i:i + phrase_len]
+                rep = 1
+                j = i + phrase_len
+                while j + phrase_len <= len(words) and words[j:j + phrase_len] == p1:
+                    rep += 1
+                    j += phrase_len
+                if rep > max_word_rep:
+                    max_word_rep = rep
+
+    # 2. Thai repetition marker (ๆ)
+    mai_yamok = len(re.findall(r'ๆ+', text))
+    if mai_yamok > 0:
+        max_word_rep = max(max_word_rep, 2 + mai_yamok)
+
+    # 3. Consecutive identical CJK characters (e.g. '好好', '不不不')
+    max_cjk_rep = 1
+    for m in re.finditer(r'(\S)\1+', text):
+        ch = m.group(1)
+        if is_cjk_char(ch):
+            span_len = len(m.group(0))
+            if span_len > max_cjk_rep:
+                max_cjk_rep = span_len
+
+    # 4. Multi-char repeated phrases in CJK (e.g. 'だめだめ', '快点快点')
+    for sub_len in (2, 3, 4):
+        for i in range(len(text) - sub_len * 2 + 1):
+            sub = text[i:i + sub_len]
+            if not sub.strip() or not any(is_cjk_char(c) for c in sub):
+                continue
+            rep = 1
+            j = i + sub_len
+            while j + sub_len <= len(text) and text[j:j + sub_len] == sub:
+                rep += 1
+                j += sub_len
+            if rep > max_word_rep:
+                max_word_rep = rep
+
+    # 5. Extended emotional stretching in alphabetic languages (e.g. 'nooooo', '55555') (3+ chars)
+    for m in re.finditer(r'(\S)\1{2,}', text):
+        if not is_cjk_char(m.group(1)):
+            max_word_rep = max(max_word_rep, 2)
+
+    return max(max_word_rep, max_cjk_rep)
+
+
+LEGITIMATE_CONSECUTIVE_WORDS = {'had', 'that'}
+NON_PLURAL_S_PAIRS = {
+    ("new", "news"), ("news", "new"),
+    ("good", "goods"), ("goods", "good"),
+    ("custom", "customs"), ("customs", "custom"),
+    ("beside", "besides"), ("besides", "beside"),
+    ("wood", "woods"), ("woods", "wood"),
+    ("arm", "arms"), ("arms", "arm"),
+}
+
+
+def are_tokens_equivalent(t1, t2):
+    """Checks whether two tokens are identical, singular/plural, British/American variants,
+    or morphological near-duplicates."""
+    w1 = re.sub(r'^[^\w]+|[^\w]+$', '', t1.lower(), flags=re.UNICODE)
+    w2 = re.sub(r'^[^\w]+|[^\w]+$', '', t2.lower(), flags=re.UNICODE)
+    if not w1 or not w2:
+        return False
+    # Legitimate grammatical duplicates (e.g. "He had had a cold", "that that")
+    if w1 == w2 and w1 in LEGITIMATE_CONSECUTIVE_WORDS:
+        return False
+    if w1 == w2:
+        return True
+    # Exclude non-plural English word pairs (e.g. "new news", "good goods")
+    if (w1, w2) in NON_PLURAL_S_PAIRS:
+        return False
+    # Singular / Plural (e.g. minute vs minutes, kilometer vs kilometers, gato vs gatos)
+    if w1 + 's' == w2 or w2 + 's' == w1:
+        return True
+    if w1 + 'es' == w2 or w2 + 'es' == w1:
+        return True
+    # British vs American English spelling variations:
+    # -re vs -er (kilometres/kilometers, centre/center, theatre/theater, metres/meters)
+    w1_stem = re.sub(r're(s?)$', r'er\1', w1)
+    w2_stem = re.sub(r're(s?)$', r'er\1', w2)
+    if w1_stem == w2_stem or w1_stem == w2 or w2_stem == w1:
+        return True
+    # -our vs -or (colour/color, favour/favor, honour/honor, flavour/flavor)
+    w1_our = re.sub(r'our(s?)$', r'or\1', w1)
+    w2_our = re.sub(r'our(s?)$', r'or\1', w2)
+    if w1_our == w2_our or w1_our == w2 or w2_our == w1:
+        return True
+    # -ise vs -ize (organise/organize, realise/realize)
+    w1_ise = re.sub(r'ise(s?|d|ing)?$', r'ize\1', w1)
+    w2_ise = re.sub(r'ise(s?|d|ing)?$', r'ize\1', w2)
+    if w1_ise == w2_ise or w1_ise == w2 or w2_ise == w1:
+        return True
+    # -yse vs -yze (analyse/analyze, catalyse/catalyze)
+    w1_yse = re.sub(r'yse(s?|d|ing)?$', r'yze\1', w1)
+    w2_yse = re.sub(r'yse(s?|d|ing)?$', r'yze\1', w2)
+    if w1_yse == w2_yse or w1_yse == w2 or w2_yse == w1:
+        return True
+    # High-similarity morphological near-duplicates (common prefix >= 4, ratio >= 0.85)
+    if len(w1) >= 5 and len(w2) >= 5 and abs(len(w1) - len(w2)) <= 2:
+        if difflib.SequenceMatcher(None, w1, w2).ratio() >= 0.85:
+            cp = 0
+            for c1, c2 in zip(w1, w2):
+                if c1 == c2:
+                    cp += 1
+                else:
+                    break
+            if cp >= 4:
+                return True
+    return False
+
+
+def are_phrase_blocks_equivalent(b1, b2):
+    """Checks whether two token blocks (phrases) are equivalent element-by-element."""
+    if len(b1) != len(b2):
+        return False
+    return all(are_tokens_equivalent(t1, t2) for t1, t2 in zip(b1, b2))
+
+
+def remove_trailing_degenerative_loops(target_text, source_text):
+    """Removes trailing degenerative repetition loops, full-sentence duplication, and phrase loops.
+    100% Language-Agnostic."""
+    if not target_text or not isinstance(target_text, str) or len(target_text) < 4:
+        return target_text
+
+    max_src_rep = get_max_consecutive_repetitions(source_text)
+    if max_src_rep >= 2:
+        return target_text
+
+    res = target_text.strip()
+    tokens = res.split()
+    n = len(tokens)
+
+    # Step 1: Check full-sentence / full-clause duplication: e.g. "Sim 3GB RAM use Sim 3GB RAM use"
+    if n >= 2:
+        for k in range(1, n // 2 + 1):
+            if n % k == 0:
+                p0 = tokens[:k]
+                num_repeats = n // k
+                is_all_equal = True
+                for rep_idx in range(1, num_repeats):
+                    p_curr = tokens[rep_idx * k:(rep_idx + 1) * k]
+                    if not are_phrase_blocks_equivalent(p0, p_curr):
+                        is_all_equal = False
+                        break
+                if is_all_equal and num_repeats >= 2:
+                    first_block = tokens[:k]
+                    res = " ".join(first_block)
+                    return res
+
+    # Step 1.5: Remove consecutive equivalent / near-duplicate tokens within the sentence (e.g. "kilometres kilometers" -> "kilometres")
+    if len(tokens) >= 2:
+        new_tokens = []
+        i = 0
+        while i < len(tokens):
+            curr = tokens[i]
+            new_tokens.append(curr)
+            while i + 1 < len(tokens) and are_tokens_equivalent(curr, tokens[i + 1]):
+                discarded = tokens[i + 1]
+                if not re.search(r'[^\w\s]$', curr) and re.search(r'[^\w\s]$', discarded):
+                    punct = re.findall(r'[^\w\s]+$', discarded)[0]
+                    new_tokens[-1] = curr + punct
+                i += 1
+            i += 1
+        tokens = new_tokens
+
+    # Step 2: Iteratively trim trailing repeated phrases or words (k from 1 to 6)
+    changed = True
+    while changed and len(tokens) >= 2:
+        changed = False
+        for k in range(min(6, len(tokens) // 2), 0, -1):
+            tail_p = tokens[-k:]
+            prev_p = tokens[-2 * k:-k]
+            if tail_p and are_phrase_blocks_equivalent(tail_p, prev_p):
+                tokens = tokens[:-k]
+                changed = True
+                break
+
+    # Step 3: If the trailing single token is an echo of an earlier word
+    if len(tokens) >= 2:
+        last_word = tokens[-1]
+        for prev_token in tokens[-7:-1]:
+            if are_tokens_equivalent(last_word, prev_token):
+                if tokens[-2] and tokens[-2][-1] in ('.', '!', '?', ';', ':', '。', '！', '？', ','):
+                    tokens = tokens[:-1]
+                    break
+
+    res = " ".join(tokens)
+    return res
 
 
 def clean_output_text(translated_text, original_text):
-    """Sanitizes translation output by removing artificial NMT dialogue dashes and subword artifacts."""
+    """Sanitizes translation output by removing artificial NMT dialogue dashes, subword artifacts,
+    and trailing degenerative repetition loops."""
     if not translated_text:
         return ""
     res = translated_text.strip()
@@ -2418,6 +2856,10 @@ def clean_output_text(translated_text, original_text):
             res = res[2:].strip()
         elif res.startswith(("-", "—", "–", "_")) and len(res) > 1 and res[1] not in ("0", "1", "2", "3", "4", "5", "6", "7", "8", "9"):
             res = res[1:].strip()
+
+    if orig_stripped:
+        res = remove_trailing_degenerative_loops(res, orig_stripped)
+
     return res
 
 
@@ -2444,6 +2886,107 @@ def normalize_newlines(text):
     )
 
 
+THAI_UNITS_AND_CLASSIFIERS = {
+    'ชั่วโมง', 'ชม.', 'ชม', 'นาที', 'วินาที', 'วิ', 'วัน', 'เดือน', 'ปี',
+    'คน', 'ท่าน', 'นาย', 'บาท', 'สตางค์', 'เมตร', 'กิโลเมตร', 'กม.', 'กม',
+    'กิโล', 'กิโลกรัม', 'กก.', 'กก', 'กรัม', 'ลิตร', 'มิลลิลิตร',
+    'ชิ้น', 'ตัว', 'อัน', 'เครื่อง', 'ใบ', 'เล่ม', 'ข้อ', 'ครั้ง', 'รอบ',
+    'เปอร์เซ็นต์', '%', 'เท่า', 'แห่ง', 'จุด', 'ระดับ'
+}
+
+THAI_CONNECTORS = {
+    'ใน', 'ของ', 'ที่', 'และ', 'หรือ', 'กับ', 'แต่', 'ถ้า', 'หาก', 'เพราะ',
+    'เพื่อ', 'โดย', 'จาก', 'ไป', 'มา', 'ตาม', 'ต่อ', 'ถึง', 'จึง', 'ก็'
+}
+
+LATIN_ABBREVIATIONS = {
+    'mr', 'mrs', 'ms', 'dr', 'prof', 'sr', 'jr', 'vs', 'eg', 'ie', 'etc',
+    'dept', 'est', 'approx', 'no', 'vol', 'st', 'ave', 'rd'
+}
+
+
+def split_line_into_sentences(line_str, src_lang="auto"):
+    """Splits a single line of text into natural sentence and clause units with paired delimiters,
+    preventing seq2seq NMT models (NLLB-200, Opus-MT) from terminating early while protecting
+    context, abbreviations, numbers, and Thai units from erroneous fragmentation."""
+    if not line_str or not line_str.strip():
+        return [(line_str, "")]
+
+    # 1. Split on standard sentence boundaries (. ! ? 。 ！？), protecting abbreviations and initials
+    raw_units = []
+    boundary_pattern = re.compile(r'([.!?][\'"”’)]?)(\s+)|([。！？])(\s*)')
+    last_idx = 0
+    for m in boundary_pattern.finditer(line_str):
+        if m.group(1):
+            punct_end = m.end(1)
+            token_before = line_str[last_idx:punct_end]
+            # Check if period belongs to an abbreviation (e.g. 'Dr.', 'Mr.', 'e.g.')
+            m_word = re.search(r'([a-zA-Z]+)\.$', token_before)
+            if m_word and m_word.group(1).lower() in LATIN_ABBREVIATIONS:
+                continue
+            # Check single-letter initials (e.g. 'J. K.')
+            if re.search(r'\b[a-zA-Z]\.$', token_before):
+                continue
+
+            sent_text = token_before
+            sent_delim = m.group(2)
+            last_idx = m.end()
+            raw_units.append((sent_text, sent_delim))
+        elif m.group(3):
+            sent_text = line_str[last_idx:m.end(3)]
+            sent_delim = m.group(4)
+            last_idx = m.end()
+            raw_units.append((sent_text, sent_delim))
+
+    if last_idx < len(line_str):
+        rem = line_str[last_idx:]
+        if rem:
+            raw_units.append((rem, ""))
+
+    if not raw_units:
+        raw_units = [(line_str, "")]
+
+    # 2. Thai space clause splitting: Only split very long paragraphs (>= 100 chars),
+    # strictly protecting numbers, units, classifiers, and short phrases.
+    final_units = []
+    for content, delim in raw_units:
+        has_thai = bool(re.search(r'[\u0E00-\u0E7F]', content))
+        if not has_thai or ' ' not in content or len(content.strip()) < 100:
+            final_units.append((content, delim))
+            continue
+
+        space_parts = content.split(' ')
+        accum = []
+        curr_clause = ""
+        for sp_part in space_parts:
+            if not curr_clause:
+                curr_clause = sp_part
+                continue
+
+            curr_ends_with_digit = bool(re.search(r'\d+$', curr_clause.strip()))
+            next_is_unit_or_connector = (sp_part.strip() in THAI_UNITS_AND_CLASSIFIERS or
+                                         sp_part.strip() in THAI_CONNECTORS)
+
+            is_safe_boundary = (
+                len(curr_clause) >= 40 and
+                not curr_ends_with_digit and
+                not next_is_unit_or_connector and
+                len(sp_part.strip()) >= 6
+            )
+
+            if is_safe_boundary:
+                accum.append((curr_clause, " "))
+                curr_clause = sp_part
+            else:
+                curr_clause += " " + sp_part
+
+        if curr_clause:
+            accum.append((curr_clause, delim))
+        final_units.extend(accum)
+
+    return final_units
+
+
 def translate_offline(text, model_id, src_lang="en", tgt_lang="th"):
     """Translates text offline with support for Multilingual and Bilingual models."""
     if not text or not isinstance(text, str) or not text.strip():
@@ -2453,9 +2996,12 @@ def translate_offline(text, model_id, src_lang="en", tgt_lang="th"):
     if not os.path.exists(model_dir):
         raise Exception(_("Model directory not found: ") + model_id)
 
-    engine = get_loaded_engine(model_dir)
-    if not engine:
-        raise Exception(_("Offline neural engine runtime is not available or model is invalid."))
+    norm_dir = _normalize_model_path(model_dir)
+    with _ENGINE_LOCK:
+        engine = get_loaded_engine(model_dir)
+        if not engine:
+            raise Exception(_("Offline neural engine runtime is not available or model is invalid."))
+        _ACTIVE_TRANSLATIONS[norm_dir] += 1
 
     try:
         sp = engine["sp"]
@@ -2464,11 +3010,14 @@ def translate_offline(text, model_id, src_lang="en", tgt_lang="th"):
         is_multilingual = supp_info.get("is_multilingual", True)
 
         lines = normalize_newlines(text).split("\n")
+        record_offline_activity()
+        logHandler.log.info(f"OmniTranslate: Translating offline with '{model_id}' (src: {src_lang}, tgt: {tgt_lang}, input: {len(text)} chars)")
         batch_inputs = []
-        batch_indices = []
+        line_units = [[] for _idx in range(len(lines))]
         max_raw_len = 1
 
         if is_multilingual:
+            is_madlad = "madlad" in model_id.lower() or supp_info.get("model_type") == "madlad"
             clean_src = src_lang.lower() if src_lang else "en"
             clean_tgt = tgt_lang.lower() if tgt_lang else "th"
             if clean_src not in NLLB_LANG_MAP:
@@ -2476,45 +3025,80 @@ def translate_offline(text, model_id, src_lang="en", tgt_lang="th"):
             if clean_tgt not in NLLB_LANG_MAP:
                 clean_tgt = clean_tgt.split("-")[0]
 
-            if clean_tgt not in NLLB_LANG_MAP:
+            if not is_madlad and clean_tgt not in NLLB_LANG_MAP:
                 tgt_display = get_language_display_name(tgt_lang)
                 raise Exception(_("The offline model does not support target language '{lang}'.").format(lang=tgt_display))
 
-            nllb_src = NLLB_LANG_MAP.get(clean_src, "eng_Latn")
-            nllb_tgt = NLLB_LANG_MAP[clean_tgt]
+            if is_madlad:
+                madlad_tgt = clean_tgt.split("-")[0]
+            else:
+                nllb_src = NLLB_LANG_MAP.get(clean_src, "eng_Latn")
+                nllb_tgt = NLLB_LANG_MAP[clean_tgt]
 
-            for idx, line in enumerate(lines):
+            for line_idx, line in enumerate(lines):
                 line_str = line.strip()
-                if line_str:
-                    raw_tokens = sp.encode(line_str, out_type=str)
-                    if len(raw_tokens) > max_raw_len:
-                        max_raw_len = len(raw_tokens)
-                    source_tokens = raw_tokens + ["</s>", nllb_src]
+                if not line_str:
+                    continue
+                lead_space = line[:len(line) - len(line.lstrip())]
+                sent_units = split_line_into_sentences(line_str, src_lang=clean_src)
+                for u_idx, (sent_text, sent_delim) in enumerate(sent_units):
+                    st = sent_text.strip()
+                    if not st:
+                        line_units[line_idx].append((None, sent_delim, sent_text, lead_space if u_idx == 0 else ""))
+                        continue
+                    if is_madlad:
+                        source_tokens = sp.encode(f"<2{madlad_tgt}> {st}", out_type=str)
+                        if len(source_tokens) > max_raw_len:
+                            max_raw_len = len(source_tokens)
+                    else:
+                        raw_tokens = sp.encode(st, out_type=str)
+                        if len(raw_tokens) > max_raw_len:
+                            max_raw_len = len(raw_tokens)
+                        source_tokens = raw_tokens + ["</s>", nllb_src]
+                    b_idx = len(batch_inputs)
                     batch_inputs.append(source_tokens)
-                    batch_indices.append((idx, line_str))
+                    line_units[line_idx].append((b_idx, sent_delim, st, lead_space if u_idx == 0 else ""))
 
             if not batch_inputs:
                 return text
 
-            target_prefix = [[nllb_tgt]] * len(batch_inputs)
+            target_prefix = None if is_madlad else ([[nllb_tgt]] * len(batch_inputs))
             max_dec = max(128, int(max_raw_len * 4) + 64)
+
+            translate_kwargs = {
+                "beam_size": 4,
+                "repetition_penalty": 1.12,
+                "no_repeat_ngram_size": 0,
+                "max_decoding_length": max_dec
+            }
+            if target_prefix is not None:
+                translate_kwargs["target_prefix"] = target_prefix
 
             results = translator.translate_batch(
                 batch_inputs,
-                target_prefix=target_prefix,
-                beam_size=4,
-                repetition_penalty=1.05,
-                no_repeat_ngram_size=0,
-                max_decoding_length=max_dec
+                **translate_kwargs
             )
 
-            output_lines = list(lines)
-            for res_idx, (line_idx, orig_line) in enumerate(batch_indices):
-                hyp = results[res_idx].hypotheses[0]
-                clean_tokens = [tok for tok in hyp if tok not in ALL_NLLB_SPECIAL_TOKENS and not tok.endswith(KNOWN_TAG_SUFFIXES)]
-                translated = sp.decode(clean_tokens)
-                cleaned = clean_output_text(translated, orig_line)
-                output_lines[line_idx] = cleaned if cleaned else orig_line
+            output_lines = []
+            for line_idx, orig_line in enumerate(lines):
+                if not orig_line.strip():
+                    output_lines.append(orig_line)
+                    continue
+                line_parts = []
+                for b_idx, sent_delim, orig_sent, lead_space in line_units[line_idx]:
+                    if b_idx is None:
+                        line_parts.append(lead_space + orig_sent + sent_delim)
+                        continue
+                    hyp = results[b_idx].hypotheses[0]
+                    if is_madlad:
+                        clean_tokens = [tok for tok in hyp if tok not in {"</s>", "<s>", "<pad>", "<unk>"} and not tok.startswith("<2")]
+                    else:
+                        clean_tokens = [tok for tok in hyp if tok not in ALL_NLLB_SPECIAL_TOKENS and not tok.endswith(KNOWN_TAG_SUFFIXES)]
+                    translated = sp.decode(clean_tokens)
+                    cleaned = clean_output_text(translated, orig_sent)
+                    final_trans = cleaned if cleaned else orig_sent
+                    line_parts.append(lead_space + final_trans + sent_delim)
+                output_lines.append("".join(line_parts))
 
             return "\r\n".join(output_lines)
 
@@ -2527,14 +3111,25 @@ def translate_offline(text, model_id, src_lang="en", tgt_lang="th"):
                 raise Exception(_("The offline model '{model}' does not support target language '{lang}'.").format(model=model_id, lang=tgt_display))
 
             special_tokens = {"</s>", "<s>", "<pad>", "<unk>"}
-            for idx, line in enumerate(lines):
+            clean_src = src_lang.lower() if src_lang else "en"
+
+            for line_idx, line in enumerate(lines):
                 line_str = line.strip()
-                if line_str:
-                    raw_tokens = sp.encode(line_str, out_type=str)
+                if not line_str:
+                    continue
+                lead_space = line[:len(line) - len(line.lstrip())]
+                sent_units = split_line_into_sentences(line_str, src_lang=clean_src)
+                for u_idx, (sent_text, sent_delim) in enumerate(sent_units):
+                    st = sent_text.strip()
+                    if not st:
+                        line_units[line_idx].append((None, sent_delim, sent_text, lead_space if u_idx == 0 else ""))
+                        continue
+                    raw_tokens = sp.encode(st, out_type=str)
                     if len(raw_tokens) > max_raw_len:
                         max_raw_len = len(raw_tokens)
+                    b_idx = len(batch_inputs)
                     batch_inputs.append(raw_tokens)
-                    batch_indices.append((idx, line_str))
+                    line_units[line_idx].append((b_idx, sent_delim, st, lead_space if u_idx == 0 else ""))
 
             if not batch_inputs:
                 return text
@@ -2543,18 +3138,28 @@ def translate_offline(text, model_id, src_lang="en", tgt_lang="th"):
             results = translator.translate_batch(
                 batch_inputs,
                 beam_size=4,
-                repetition_penalty=1.05,
+                repetition_penalty=1.12,
                 no_repeat_ngram_size=0,
                 max_decoding_length=max_dec
             )
 
-            output_lines = list(lines)
-            for res_idx, (line_idx, orig_line) in enumerate(batch_indices):
-                hyp = results[res_idx].hypotheses[0]
-                clean_tokens = [tok for tok in hyp if tok not in special_tokens]
-                translated = sp.decode(clean_tokens)
-                cleaned = clean_output_text(translated, orig_line)
-                output_lines[line_idx] = cleaned if cleaned else orig_line
+            output_lines = []
+            for line_idx, orig_line in enumerate(lines):
+                if not orig_line.strip():
+                    output_lines.append(orig_line)
+                    continue
+                line_parts = []
+                for b_idx, sent_delim, orig_sent, lead_space in line_units[line_idx]:
+                    if b_idx is None:
+                        line_parts.append(lead_space + orig_sent + sent_delim)
+                        continue
+                    hyp = results[b_idx].hypotheses[0]
+                    clean_tokens = [tok for tok in hyp if tok not in special_tokens]
+                    translated = sp.decode(clean_tokens)
+                    cleaned = clean_output_text(translated, orig_sent)
+                    final_trans = cleaned if cleaned else orig_sent
+                    line_parts.append(lead_space + final_trans + sent_delim)
+                output_lines.append("".join(line_parts))
 
             return "\r\n".join(output_lines)
 
@@ -2564,3 +3169,8 @@ def translate_offline(text, model_id, src_lang="en", tgt_lang="th"):
         if "Offline translation error:" in err_str or "does not support" in err_str or "Model directory not found" in err_str:
             raise e
         raise Exception(_("Offline translation error: ") + err_str)
+    finally:
+        with _ENGINE_LOCK:
+            _ACTIVE_TRANSLATIONS[norm_dir] -= 1
+            if _ACTIVE_TRANSLATIONS[norm_dir] <= 0:
+                _ACTIVE_TRANSLATIONS.pop(norm_dir, None)

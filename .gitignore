@@ -1,6 +1,7 @@
-﻿# Development guidelines and AI instruction files
+# Development guidelines and AI instruction files
 AGENTS.md
 GEMINI.md
+.agents/
 
 # Python compiled bytecode and caches
 __pycache__/
@@ -15,3 +16,11 @@ omni_translate_models/
 Thumbs.db
 .vscode/
 .idea/
+
+# Developer diagnostic tools (local testing only, never shipped)
+dev_tools/
+scratch/
+scratch_config/
+*.log
+doc/CODE_MAP.md
+

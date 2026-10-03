@@ -13,6 +13,7 @@ import globalVars
 import api
 import ui
 import tones
+import threading
 from . import offlineEngine
 
 addonHandler.initTranslation()
@@ -407,7 +408,7 @@ def load_config():
 
 
 def save_config(cfg_updates):
-    if getattr(globalVars.appArgs, "secureMode", False):
+    if getattr(globalVars.appArgs, "secure", False) or getattr(globalVars.appArgs, "secureMode", False):
         return
     try:
         current_cfg = load_config()
@@ -429,12 +430,12 @@ class ResultViewerDialog(wx.Dialog):
         )
         self.result_text = result_text
         sizer = wx.BoxSizer(wx.VERTICAL)
-        self.textCtrl = wx.TextCtrl(self, value=result_text, style=wx.TE_MULTILINE | wx.TE_READONLY | wx.HSCROLL)
+        self.textCtrl = wx.TextCtrl(self, value=result_text, style=wx.TE_MULTILINE | wx.TE_READONLY | wx.HSCROLL, name=_("Translation Result"))
         sizer.Add(self.textCtrl, 1, wx.EXPAND | wx.ALL, 10)
 
         btnSizer = wx.BoxSizer(wx.HORIZONTAL)
         copyBtn = wx.Button(self, label=_("&Copy to Clipboard"))
-        closeBtn = wx.Button(self, wx.ID_CANCEL, label=_("&Close"))
+        closeBtn = wx.Button(self, wx.ID_CANCEL, label=_("Clos&e"))
         copyBtn.Bind(wx.EVT_BUTTON, self.onCopy)
         closeBtn.Bind(wx.EVT_BUTTON, self.onClose)
 
@@ -489,7 +490,7 @@ class HistoryDialog(wx.Dialog):
         if not choices:
             choices = [_("No translation history available for this session.")]
 
-        self.listBox = wx.ListBox(self, choices=choices)
+        self.listBox = wx.ListBox(self, choices=choices, name=_("Translation History"))
         self.listBox.SetSelection(0)
         self.listBox.Bind(wx.EVT_LISTBOX_DCLICK, self.onView)
         self.listBox.Bind(wx.EVT_KEY_DOWN, self.onListKeyDown)
@@ -497,7 +498,7 @@ class HistoryDialog(wx.Dialog):
 
         btnSizer = wx.BoxSizer(wx.HORIZONTAL)
         viewBtn = wx.Button(self, label=_("&View Full Translation"))
-        closeBtn = wx.Button(self, wx.ID_CANCEL, label=_("&Close"))
+        closeBtn = wx.Button(self, wx.ID_CANCEL, label=_("Clos&e"))
         viewBtn.Bind(wx.EVT_BUTTON, self.onView)
         closeBtn.Bind(wx.EVT_BUTTON, self.onClose)
         viewBtn.SetDefault()
@@ -564,7 +565,7 @@ class QuickSlotsDialog(wx.Dialog):
         mainSizer = wx.BoxSizer(wx.VERTICAL)
         
         if slot_type == "target":
-            desc_text = _("Assign languages to Target Quick Slots 1 - 10 (Press keys 1 - 0 in Layer mode to translate instantly):")
+            desc_text = _("Assign languages to Target Quick Slots 1 - 10 (Press keys 1 - 0 in Layer mode to switch target language and translate instantly):")
         else:
             desc_text = _("Assign languages to Source Quick Slots 1 - 10 (Press keys Shift+1 - Shift+0 in Layer mode to switch source language):")
         descLabel = wx.StaticText(self, label=desc_text)
@@ -706,33 +707,37 @@ class OmniTranslateGeneralSettingsPanel(SettingsPanel):
     def onConfigureTargetSlots(self, evt):
         def _show():
             gui.mainFrame.prePopup()
-            d = QuickSlotsDialog(
-                self,
-                slot_type="target",
-                current_slots=self.pendingTargetSlots,
-                lang_keys=_CLEAN_ALL_LANG_KEYS,
-                lang_names=_CLEAN_ALL_LANG_NAMES
-            )
-            if d.ShowModal() == wx.ID_OK:
-                self.pendingTargetSlots.update(d.getSlots())
-            d.Destroy()
-            gui.mainFrame.postPopup()
+            try:
+                d = QuickSlotsDialog(
+                    self,
+                    slot_type="target",
+                    current_slots=self.pendingTargetSlots,
+                    lang_keys=_CLEAN_ALL_LANG_KEYS,
+                    lang_names=_CLEAN_ALL_LANG_NAMES
+                )
+                if d.ShowModal() == wx.ID_OK:
+                    self.pendingTargetSlots.update(d.getSlots())
+                d.Destroy()
+            finally:
+                gui.mainFrame.postPopup()
         wx.CallAfter(_show)
 
     def onConfigureSourceSlots(self, evt):
         def _show():
             gui.mainFrame.prePopup()
-            d = QuickSlotsDialog(
-                self,
-                slot_type="source",
-                current_slots=self.pendingSourceSlots,
-                lang_keys=_CLEAN_ALL_LANG_KEYS,
-                lang_names=_CLEAN_ALL_LANG_NAMES
-            )
-            if d.ShowModal() == wx.ID_OK:
-                self.pendingSourceSlots.update(d.getSlots())
-            d.Destroy()
-            gui.mainFrame.postPopup()
+            try:
+                d = QuickSlotsDialog(
+                    self,
+                    slot_type="source",
+                    current_slots=self.pendingSourceSlots,
+                    lang_keys=_CLEAN_ALL_LANG_KEYS,
+                    lang_names=_CLEAN_ALL_LANG_NAMES
+                )
+                if d.ShowModal() == wx.ID_OK:
+                    self.pendingSourceSlots.update(d.getSlots())
+                d.Destroy()
+            finally:
+                gui.mainFrame.postPopup()
         wx.CallAfter(_show)
 
     def onModeChange(self, evt):
@@ -818,6 +823,8 @@ class OmniTranslateGeneralSettingsPanel(SettingsPanel):
             updates.update(self.pendingSourceSlots)
 
         save_config(updates)
+        if "translationMode" in updates:
+            offlineEngine.on_mode_changed(updates["translationMode"])
 
 
 class OmniTranslateOfflineModelsPanel(SettingsPanel):
@@ -843,14 +850,17 @@ class OmniTranslateOfflineModelsPanel(SettingsPanel):
         self.updateModelInfo()
 
         self.catalog = offlineEngine.OFFLINE_MODELS_CATALOG
-        catalog_names = [m["name"] for m in self.catalog]
+        catalog_names = [
+            f"{m['name']} — {m['min_specs']}" if m.get("min_specs") else m["name"]
+            for m in self.catalog
+        ]
         self.catalogChoice = sHelper.addLabeledControl(_("Download recommended offline model:"), wx.Choice, choices=catalog_names)
         self.catalogChoice.SetSelection(0)
 
         # Model Action Buttons
         btnSizer = wx.BoxSizer(wx.HORIZONTAL)
         self.downloadBtn = wx.Button(self, label=_("&Download Model"))
-        self.deleteBtn = wx.Button(self, label=_("&Delete Model"))
+        self.deleteBtn = wx.Button(self, label=_("&Uninstall Model"))
         self.openFolderBtn = wx.Button(self, label=_("&Open Models Folder"))
 
         self.downloadBtn.Bind(wx.EVT_BUTTON, self.onDownload)
@@ -867,7 +877,6 @@ class OmniTranslateOfflineModelsPanel(SettingsPanel):
             sel = self.installedChoice.GetSelection()
             if sel != wx.NOT_FOUND and 0 <= sel < len(self.installed):
                 self.cur_model = self.installed[sel]
-                save_config({"offlineModel": self.cur_model})
                 self.updateModelInfo()
 
     def updateModelInfo(self):
@@ -875,7 +884,10 @@ class OmniTranslateOfflineModelsPanel(SettingsPanel):
             self.modelInfoText.SetLabel(_("No model selected. Download a model to use Offline Mode."))
             return
         supp_info = offlineEngine.get_model_supported_languages(self.cur_model)
-        if supp_info.get("is_multilingual", True):
+        is_madlad = "madlad" in self.cur_model.lower() or supp_info.get("model_type") == "madlad"
+        if is_madlad:
+            self.modelInfoText.SetLabel(_("Model type: Google MADLAD-400 (Ultra Multilingual 3B Parameters)"))
+        elif supp_info.get("is_multilingual", True):
             self.modelInfoText.SetLabel(_("Model type: Multilingual (Supports all 100+ languages, bidirectional enabled)"))
         else:
             src = supp_info.get("src", ["?"])[0]
@@ -885,7 +897,7 @@ class OmniTranslateOfflineModelsPanel(SettingsPanel):
             self.modelInfoText.SetLabel(_("Model type: Single Language Pair ({src} -> {tgt} only)").format(src=s_name, tgt=t_name))
 
     def onOpenFolder(self, evt):
-        if getattr(globalVars.appArgs, "secureMode", False):
+        if getattr(globalVars.appArgs, "secure", False) or getattr(globalVars.appArgs, "secureMode", False):
             ui.message(_("Explorer cannot be opened on secure screens."))
             return
         try:
@@ -898,7 +910,23 @@ class OmniTranslateOfflineModelsPanel(SettingsPanel):
         sel_idx = self.catalogChoice.GetSelection()
         if sel_idx != wx.NOT_FOUND and self.catalog:
             model_info = self.catalog[sel_idx]
-            offlineEngine.download_model_package(model_info, on_complete=self._refreshInstalled)
+            size_mb = model_info.get("approx_size_mb", 0)
+            specs = model_info.get("min_specs", "")
+            if size_mb >= 2000:
+                msg = _("The selected model '{name}' requires approximately {size} MB of download and high hardware specifications ({specs}).\n\nDo you want to proceed with the download?").format(
+                    name=model_info["name"],
+                    size=size_mb,
+                    specs=specs
+                )
+                if gui.messageBox(msg, _("Confirm Model Download"), wx.YES_NO | wx.ICON_INFORMATION, self) != wx.YES:
+                    return
+            import weakref
+            weak_self = weakref.ref(self)
+            def _on_done(model_id):
+                panel = weak_self()
+                if panel and bool(panel):
+                    panel._refreshInstalled(model_id)
+            offlineEngine.download_model_package(model_info, on_complete=_on_done)
 
     def onDeleteModel(self, evt):
         if not self.installed:
@@ -907,12 +935,25 @@ class OmniTranslateOfflineModelsPanel(SettingsPanel):
         sel_idx = self.installedChoice.GetSelection()
         if sel_idx != wx.NOT_FOUND and 0 <= sel_idx < len(self.installed):
             chosen = self.installed[sel_idx]
+            if offlineEngine.is_model_busy(chosen):
+                tones.beep(200, 70)
+                ui.message(_("Cannot delete model: The model is currently translating text. Please wait for translation to finish."))
+                return
+
             msg = _("Are you sure you want to uninstall and delete the offline model '{name}'?").format(name=chosen)
             if gui.messageBox(msg, _("Confirm Model Deletion"), wx.YES_NO | wx.ICON_QUESTION, self) == wx.YES:
+                if offlineEngine.is_model_busy(chosen):
+                    tones.beep(200, 70)
+                    ui.message(_("Cannot delete model: The model is currently translating text. Please wait for translation to finish."))
+                    return
+
                 if offlineEngine.delete_installed_model(chosen):
                     tones.beep(440, 40)
                     ui.message(_("Model {name} deleted successfully.").format(name=chosen))
                     self._refreshAfterDelete()
+                else:
+                    tones.beep(200, 70)
+                    ui.message(_("Failed to delete model {name}.").format(name=chosen))
 
     def _refreshAfterDelete(self):
         def _update():
