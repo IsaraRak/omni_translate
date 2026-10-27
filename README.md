@@ -30,7 +30,7 @@ OmniTranslate uses a conflict-free 2-step layered command system designed to pre
 - **Dual-Engine Failover**: In Online mode, automatically falls back to secondary endpoints or local offline neural models if internet connectivity is lost or rate-limited.
 - **Dedicated Target and Source Quick Keys (1–10 & Shift+1–0)**: Configure up to 10 frequently used languages independently for target and source. Press `1`–`0` (`0` = Slot 10) to translate immediately to target slots, or `Shift + 1`–`Shift + 0` to quickly set your source language without translating. Configured via two dedicated buttons in the General Settings panel.
 - **Automated Background Updates**: Silently and automatically checks for official GitHub releases in the background 10 seconds after NVDA starts up, eliminating NVDA startup freezing or modal disruptions while keeping the add-on up to date.
-- **Intelligent Batch Chunking & Layout Preservation**: Automatically segments large documents up to 50,000 characters into contextual chunks (~3,000 characters) at natural paragraph or sentence boundaries. Delimiter-pairing architecture separates paragraph breaks (`\r\n\r\n`), blank lines, and bullet lists from translation payloads, guaranteeing 100% preservation of original layout and document structure upon reassembly.
+- **Intelligent Batch Chunking & Layout Preservation**: Automatically segments large documents up to 50,000 characters into contextual chunks (~3,000 characters) at natural paragraph or sentence boundaries. Delimiter-pairing architecture separates paragraph breaks (`\r\n\r\n`), blank lines, and bullet lists from translation payloads, and a shared layout layer keeps indentation, bullets, numbering, headings, quote markers and divider lines out of the translation for both online and offline engines, restoring the original layout and document structure upon reassembly.
 - **Replace Selected Text in Editable Fields**: Optional setting to automatically replace selected text in editable fields (Notepad, Word, chat boxes, web inputs) with the translated text upon translation.
 - **Configurable Clipboard Fallback**: Choose whether OmniTranslate translates clipboard contents when no text is selected, or strictly translates only highlighted text.
 - **Quick Mode Toggle (Layer + S)**: Toggle instantly between Online and Offline translation modes with Layer + S without opening settings.
@@ -46,6 +46,8 @@ OmniTranslate uses a conflict-free 2-step layered command system designed to pre
 OmniTranslate includes an in-app Model Manager located in **NVDA Settings -> OmniTranslate: Offline Models**.
 
 ### Recommended Models (One-Click Download)
+Offline translation requires 64-bit NVDA (version 2026.1 or later). On older 32-bit NVDA versions, online translation works normally and OmniTranslate explains that offline models are unavailable instead of downloading them.
+
 - **NLLB-200 600M (int8)**: ~600 MB download. Developed by Meta. Fast, lightweight, supports 200 languages. Ideal for everyday use on laptops and budget PCs.
 - **NLLB-200 1.3B (int8)**: ~1.3 GB download. Developed by Meta. Higher translation quality and structural precision for complex and technical texts.
 - **Google MADLAD-400 3B (int8)**: ~2.95 GB download. Developed by Google Research. Flagship 3B parameter multilingual model delivering exceptional translation accuracy and structural fidelity.
@@ -87,9 +89,48 @@ Users can manually add custom CTranslate2 models to OmniTranslate:
 - **Intelligent 10-Minute Online Idle Memory Auto-Reclaim**: When running in Online Mode, if an offline model is resident in RAM (from previous offline translation or offline fallback), OmniTranslate monitors offline activity. If no offline translation is triggered for 10 minutes, the model is safely unloaded from memory and its footprint released back to Windows. This frees up ~1.2 GB to ~3.5+ GB of RAM while keeping the model intact on disk for immediate re-use. Switching to Offline Mode instantly cancels the countdown to keep the model warm in memory.
 - **Real-Time Busy Guard**: If you attempt to delete or switch an offline model while a translation or batch inference is actively running, OmniTranslate protects against crashes and Windows file-sharing violations (`ERROR_SHARING_VIOLATION`) by immediately alerting you with an audible tone and speech notification without freezing NVDA.
 - **Instant Deletion Without Restart**: When deleting an idle model via NVDA Settings, OmniTranslate safely unloads neural weights from memory to release OS file handles, then immediately deletes the folder in milliseconds. **No NVDA restart is required.**
-- **Automatic Storage Hygiene**: Model downloads stream into `.part` temporary files and atomically rename only after complete package verification. Failed downloads and downloaded add-on update packages in `%TEMP%` are unconditionally purged, ensuring zero orphaned or corrupted files remain on disk.
+- **Verified, Resumable Downloads**: Every recommended model is checked against published checksums before it is used, and only replaces the installed model after all of its files pass, so a failed, interrupted or modified download never damages a model that already works. If the connection drops, pressing **Download** again resumes from where it stopped. Free disk space is checked first, and the same model cannot be downloaded twice at once.
+- **Automatic Storage Hygiene**: A file that fails verification is deleted immediately. Unfinished downloads are kept only so they can be resumed, and are removed when the model is uninstalled. Downloaded add-on update packages in `%TEMP%` are always removed.
 
 ## Changelog
+
+### Version 2026.6
+* **Faster Online Translation**:
+  - Connections to Google are reused and opened in advance as soon as you press NVDA+Shift+T, so short texts are usually translated in a fraction of a second.
+  - Long documents are translated several parts at a time instead of one by one.
+  - Repeated phrases and text you read again are translated instantly from memory, both online and offline, saving network use, CPU and battery.
+  - Network data is compressed, making long texts faster to download.
+* **More Reliable Online Translation**:
+  - If your internet connection is lost, OmniTranslate switches to the offline model almost immediately instead of waiting for every online service to time out.
+  - When Google temporarily limits requests, OmniTranslate pauses that service automatically instead of sending more requests that would make the block longer.
+  - Long texts are given more time on slow connections, so they are no longer sent to the offline model unnecessarily.
+  - Long texts no longer fail silently, and results no longer mix translated and untranslated lines.
+  - A tone and message tell you when translation falls back to the offline model, once instead of for every part of a long document.
+  - Switching to Online mode (NVDA+Shift+T, then S) retries online translation immediately.
+* **Text Layout Preserved**:
+  - Paragraphs, blank lines, indentation, bullets, numbering (including Thai numerals), headings, quotes and divider lines now stay exactly as in the original, for both online and offline translation.
+* **More Stable Offline Translation**:
+  - Very long documents no longer risk using up memory and closing NVDA.
+  - NVDA speech stays responsive while the offline model is working.
+  - Starting a new translation stops the previous one and restores your clipboard, so translations no longer overlap.
+  - On 32-bit NVDA (2025.3 and earlier), a clear message now explains that offline translation requires 64-bit NVDA 2026.1 or later. Online translation works normally.
+* **Improved Text Replacement and Speech**:
+  - When you translate with a quick slot, "Slot 1 (English): Translating..." is now heard in full, followed by the translation.
+  - The copy and paste keystrokes OmniTranslate uses no longer interrupt NVDA speech or trigger other add-ons' clipboard announcements, such as "replaced".
+  - In standard Windows text fields, the translation is pasted without simulated keystrokes. OmniTranslate waits for slow programs, such as the Run dialog, before restoring your clipboard. If a program does not respond, the translation stays on the clipboard and you are told to press Control+V.
+* **Layer Shortcut Fixes**:
+  - Keys pressed inside the NVDA+Shift+T layer no longer reach the program you are using.
+  - Key repeats right after leaving the layer are ignored, and releasing NVDA+Shift+T no longer triggers a command too early.
+  - Alt+Tab still works while the layer is active.
+* **Security and Privacy**:
+  - Password fields remain protected, while documents, manuals and web pages that only mention passwords can now be translated.
+  - When nothing is selected, clipboard content that looks like a password, API key, access token or one-time code is no longer sent for translation. Selecting the text still translates it.
+  - Offline models are verified before use. A failed or interrupted download never damages a model that already works, and pressing Download again resumes it. Free disk space is checked first.
+  - Automatic updates are installed only if the downloaded file matches the checksum published on GitHub and is a genuine OmniTranslate package.
+  - OmniTranslate is completely inactive on secure screens (sign-in, lock screen and UAC).
+  - Fixed a memory error on 64-bit NVDA, and OmniTranslate no longer changes Windows settings that NVDA and other add-ons share.
+* **Compatibility**:
+  - Tested with NVDA 2026.3.
 
 ### Version 2026.5
 * **Added Multi-Domain Online Translation Failover Pipeline**:

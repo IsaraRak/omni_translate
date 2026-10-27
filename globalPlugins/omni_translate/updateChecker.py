@@ -5,6 +5,9 @@
 import os
 import sys
 import json
+import hashlib
+import zipfile
+import configparser
 import urllib.request
 import urllib.parse
 import tempfile
@@ -52,10 +55,10 @@ def get_current_addon_version():
     try:
         cur_addon = addonHandler.getCodeAddon()
         if cur_addon and cur_addon.manifest:
-            return cur_addon.manifest.get("version", "2026.5")
+            return cur_addon.manifest.get("version", "2026.6")
     except Exception:
         pass
-    return "2026.5"
+    return "2026.6"
 
 
 def is_safe_download_url(url):
@@ -68,6 +71,45 @@ def is_safe_download_url(url):
         return any(host == allowed or host.endswith("." + allowed) for allowed in ALLOWED_UPDATE_HOSTS)
     except Exception:
         return False
+
+
+# Update Integrity Verification
+# GitHub publishes a SHA-256 digest for every release asset ("digest": "sha256:<hex>").
+# An update is offered only when its asset carries a digest, and is installed only if the downloaded
+# file matches it exactly, is a valid add-on bundle and declares this add-on's name.
+ADDON_NAME = "omni_translate"
+MAX_UPDATE_SIZE_BYTES = 400 * 1024 * 1024
+_SHA256_DIGEST_RE = re.compile(r'^sha256:([0-9a-f]{64})$')
+
+
+class UpdateVerificationError(Exception):
+    """The downloaded update failed integrity or bundle validation."""
+
+
+def parse_asset_sha256(asset):
+    """Returns the lowercase hex SHA-256 from a GitHub release asset's 'digest' field, or None."""
+    match = _SHA256_DIGEST_RE.match(str((asset or {}).get("digest") or "").strip().lower())
+    return match.group(1) if match else None
+
+
+def validate_addon_bundle(path):
+    """Checks that the file is a zip bundle whose manifest.ini declares this add-on's name."""
+    if not zipfile.is_zipfile(path):
+        raise UpdateVerificationError("Downloaded file is not a valid add-on bundle")
+    with zipfile.ZipFile(path) as bundle:
+        for member in bundle.namelist():
+            normalized = member.replace("\\", "/")
+            if normalized.startswith("/") or ".." in normalized.split("/") or ":" in normalized:
+                raise UpdateVerificationError(f"Unsafe path in add-on bundle: {member}")
+        try:
+            manifest_text = bundle.read("manifest.ini").decode("utf-8-sig", errors="replace")
+        except KeyError:
+            raise UpdateVerificationError("Add-on bundle has no manifest.ini")
+    parser = configparser.ConfigParser(interpolation=None, strict=False)
+    parser.read_string("[manifest]\n" + manifest_text)
+    name = parser.get("manifest", "name", fallback="").strip().strip('"')
+    if name != ADDON_NAME:
+        raise UpdateVerificationError(f"Add-on bundle is for '{name}', not '{ADDON_NAME}'")
 
 
 def check_for_updates_background():
@@ -96,21 +138,26 @@ def check_for_updates_background():
         if latest_v > cur_v:
             # Find the .nvda-addon asset
             download_url = None
+            expected_sha256 = None
             for asset in data.get("assets", []):
                 name = asset.get("name", "")
                 if name.endswith(".nvda-addon"):
                     candidate_url = asset.get("browser_download_url")
-                    if candidate_url and is_safe_download_url(candidate_url):
+                    candidate_sha256 = parse_asset_sha256(asset)
+                    if candidate_url and is_safe_download_url(candidate_url) and candidate_sha256:
                         download_url = candidate_url
+                        expected_sha256 = candidate_sha256
                         break
 
-            if download_url:
-                wx.CallAfter(_prompt_user_to_update, latest_tag, download_url)
+            if download_url and expected_sha256:
+                wx.CallAfter(_prompt_user_to_update, latest_tag, download_url, expected_sha256)
+            else:
+                logHandler.log.info(f"OmniTranslate: Update {latest_tag} found but its asset has no verifiable SHA-256 digest; not offered.")
     except Exception as e:
         logHandler.log.debug(f"OmniTranslate: Auto-update check skipped/failed: {e}")
 
 
-def _prompt_user_to_update(latest_version, download_url):
+def _prompt_user_to_update(latest_version, download_url, expected_sha256=None):
     """Displays accessible confirmation dialog on GUI thread."""
     try:
         parent = gui.mainFrame
@@ -124,15 +171,16 @@ def _prompt_user_to_update(latest_version, download_url):
         if res == wx.YES:
             threading.Thread(
                 target=_download_and_install,
-                args=(download_url, latest_version),
+                args=(download_url, latest_version, expected_sha256),
                 daemon=True
             ).start()
     except Exception as e:
         logHandler.log.error(f"OmniTranslate: Error displaying update dialog: {e}")
 
 
-def _download_and_install(download_url, latest_version):
-    """Downloads the .nvda-addon bundle and invokes NVDA addonHandler installer."""
+def _download_and_install(download_url, latest_version, expected_sha256=None):
+    """Downloads the .nvda-addon bundle into a private temporary folder, verifies its SHA-256 digest and
+    bundle manifest, then invokes the NVDA add-on installer."""
     if getattr(globalVars.appArgs, "secure", False) or getattr(globalVars.appArgs, "secureMode", False):
         return
 
@@ -141,8 +189,14 @@ def _download_and_install(download_url, latest_version):
         if not is_safe_download_url(download_url):
             raise ValueError(f"Untrusted download URL: {download_url}")
 
+        expected = str(expected_sha256 or "").strip().lower()
+        if not re.match(r'^[0-9a-f]{64}$', expected):
+            raise UpdateVerificationError("No SHA-256 digest is available for this update")
+
         wx.CallAfter(ui.message, _("OmniTranslate: Downloading update..."))
-        temp_dir = tempfile.gettempdir()
+        # mkdtemp creates a folder only the current user can access, so no other process can swap
+        # the bundle between verification and installation.
+        temp_dir = tempfile.mkdtemp(prefix="omni_translate_update_")
         safe_version = re.sub(r'[^\w\.-]', '_', str(latest_version))
         temp_addon_path = os.path.join(temp_dir, f"omni_translate_{safe_version}.nvda-addon")
 
@@ -150,13 +204,26 @@ def _download_and_install(download_url, latest_version):
             download_url,
             headers={"User-Agent": "OmniTranslate-AutoUpdater"}
         )
+        hasher = hashlib.sha256()
+        total = 0
         with urllib.request.urlopen(req, timeout=30.0) as resp:
-            with open(temp_addon_path, "wb") as f_out:
+            if not is_safe_download_url(resp.geturl()):
+                raise UpdateVerificationError(f"Update download was redirected to an untrusted address: {resp.geturl()}")
+            with open(temp_addon_path, "xb") as f_out:
                 while True:
                     chunk = resp.read(64 * 1024)
                     if not chunk:
                         break
+                    total += len(chunk)
+                    if total > MAX_UPDATE_SIZE_BYTES:
+                        raise UpdateVerificationError("Update file is unexpectedly large")
+                    hasher.update(chunk)
                     f_out.write(chunk)
+
+        if hasher.hexdigest() != expected:
+            raise UpdateVerificationError("Update file checksum does not match the published SHA-256 digest")
+        validate_addon_bundle(temp_addon_path)
+        logHandler.log.info(f"OmniTranslate: Update {latest_version} verified (SHA-256 {expected[:16]}...).")
 
         def _do_install():
             nonlocal temp_addon_path
@@ -225,6 +292,7 @@ def _download_and_install(download_url, latest_version):
                 try:
                     if temp_addon_path and os.path.exists(temp_addon_path):
                         os.remove(temp_addon_path)
+                        os.rmdir(os.path.dirname(temp_addon_path))
                 except Exception:
                     pass
 
@@ -236,6 +304,7 @@ def _download_and_install(download_url, latest_version):
             try:
                 if os.path.exists(temp_addon_path):
                     os.remove(temp_addon_path)
+                os.rmdir(os.path.dirname(temp_addon_path))
             except Exception:
                 pass
 

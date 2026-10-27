@@ -6,6 +6,7 @@ import os
 import sys
 import re
 import json
+import hashlib
 import shutil
 import threading
 import time
@@ -14,6 +15,8 @@ import difflib
 from collections import defaultdict
 import urllib.request
 import urllib.error
+import urllib.parse
+import http.client
 import wx
 import globalVars
 import logHandler
@@ -42,7 +45,12 @@ ARCH_LIB_DIR = os.path.join(LIB_DIR, py_ver)
 if LIB_DIR not in sys.path:
     sys.path.insert(0, LIB_DIR)
 
-if os.path.exists(ARCH_LIB_DIR):
+# Bundled CTranslate2 / SentencePiece / NumPy binaries are x64 only. NVDA 2025.3.x and earlier run a
+# 32-bit Python that cannot load them, so the lib path is never added there (avoids shadowing other
+# add-ons' modules with unloadable binaries). Offline translation then reports a clear message instead.
+IS_64BIT_RUNTIME = sys.maxsize > 2 ** 32
+
+if IS_64BIT_RUNTIME and os.path.exists(ARCH_LIB_DIR):
     if ARCH_LIB_DIR not in sys.path:
         sys.path.insert(0, ARCH_LIB_DIR)
 
@@ -75,6 +83,64 @@ _LOADED_MODELS = {}
 _MODEL_LANG_CACHE = {}
 _ENGINE_LOCK = threading.RLock()
 _ACTIVE_TRANSLATIONS = defaultdict(int)
+
+# In-Memory LRU + TTL Offline Translation Cache (30-minute TTL, 500 entries capacity)
+_OFFLINE_TRANSLATION_CACHE = {}
+_OFFLINE_CACHE_LOCK = threading.Lock()
+OFFLINE_CACHE_TTL_SECONDS = 1800  # 30 minutes
+MAX_OFFLINE_CACHE_ENTRIES = 500
+
+
+def _get_offline_from_cache(text, model_id, src_lang, tgt_lang):
+    """Retrieves cached offline translation if within 30-minute TTL.
+    Thread-safe and refreshes LRU access order.
+    """
+    if not text:
+        return None
+    key = (text.strip(), str(model_id).strip().lower(), str(src_lang).strip().lower(), str(tgt_lang).strip().lower())
+    now = time.time()
+    with _OFFLINE_CACHE_LOCK:
+        entry = _OFFLINE_TRANSLATION_CACHE.get(key)
+        if entry:
+            res, expires_at = entry
+            if now < expires_at:
+                _OFFLINE_TRANSLATION_CACHE.pop(key, None)
+                _OFFLINE_TRANSLATION_CACHE[key] = (res, expires_at)
+                return res
+            else:
+                _OFFLINE_TRANSLATION_CACHE.pop(key, None)
+    return None
+
+
+def _put_offline_to_cache(text, model_id, src_lang, tgt_lang, translated_text):
+    """Stores offline translation into LRU cache with 30-minute TTL.
+    Caps at 500 entries, evicting the least recently used entry if full.
+    """
+    if not text or not translated_text:
+        return
+    key = (text.strip(), str(model_id).strip().lower(), str(src_lang).strip().lower(), str(tgt_lang).strip().lower())
+    now = time.time()
+    expires_at = now + OFFLINE_CACHE_TTL_SECONDS
+    with _OFFLINE_CACHE_LOCK:
+        if key in _OFFLINE_TRANSLATION_CACHE:
+            _OFFLINE_TRANSLATION_CACHE.pop(key, None)
+        elif len(_OFFLINE_TRANSLATION_CACHE) >= MAX_OFFLINE_CACHE_ENTRIES:
+            oldest_key = next(iter(_OFFLINE_TRANSLATION_CACHE))
+            _OFFLINE_TRANSLATION_CACHE.pop(oldest_key, None)
+        _OFFLINE_TRANSLATION_CACHE[key] = (translated_text, expires_at)
+
+
+def clear_offline_cache(model_id=None):
+    """Clears offline translation cache entries, optionally filtered by model_id."""
+    with _OFFLINE_CACHE_LOCK:
+        if model_id is None:
+            _OFFLINE_TRANSLATION_CACHE.clear()
+        else:
+            mid = str(model_id).strip().lower()
+            keys_to_del = [k for k in _OFFLINE_TRANSLATION_CACHE if k[1] == mid]
+            for k in keys_to_del:
+                _OFFLINE_TRANSLATION_CACHE.pop(k, None)
+
 
 LATIN_LANGS = {
     "en", "pt", "es", "fr", "de", "it", "nl", "id", "ms", "tl", "vi", "sv", "da", "fi", "no", "pl", "tr", "cs", "ro", "hu", "af", "sq", "ca", "hr", "et", "lv", "lt", "sk", "sl"
@@ -2117,6 +2183,13 @@ RECOMMENDED_MODELS = [
         "id": "nllb-200-600m",
         "name": _("NLLB-200 Standard (600M - Fast ~600 MB)"),
         "repo": "JustFrederik/nllb-200-distilled-600M-ct2-int8",
+        "revision": "302d78f00e6fdb50a1064059df7c392b735e9d05",
+        "files": [
+            {"name": "config.json", "size": 159, "git_sha1": "338d32248dd94e6268192c8354c41c0eca5eeb62"},
+            {"name": "shared_vocabulary.txt", "size": 2568098, "git_sha1": "1f831354dfc504f6b866ad05aa8efd94919badf9"},
+            {"name": "sentencepiece.bpe.model", "size": 4852054, "sha256": "14bb8dfb35c0ffdea7bc01e56cea38b9e3d5efcdcb9c251d6b40538e1aab555a"},
+            {"name": "model.bin", "size": 622595991, "sha256": "ed1beaf75134de7505315a5223162f56acff397eff6b50638a500d3936fe707b"},
+        ],
         "approx_size_mb": 600,
         "is_multilingual": True,
         "model_type": "nllb",
@@ -2126,6 +2199,13 @@ RECOMMENDED_MODELS = [
         "id": "nllb-200-1.3b",
         "name": _("NLLB-200 High Quality (1.3B - Enhanced Accuracy ~1.3 GB)"),
         "repo": "JustFrederik/nllb-200-distilled-1.3B-ct2-int8",
+        "revision": "30c36268408177b0fce2bfcfa205d877accd327d",
+        "files": [
+            {"name": "config.json", "size": 159, "git_sha1": "338d32248dd94e6268192c8354c41c0eca5eeb62"},
+            {"name": "shared_vocabulary.txt", "size": 2568098, "git_sha1": "1f831354dfc504f6b866ad05aa8efd94919badf9"},
+            {"name": "sentencepiece.bpe.model", "size": 4852054, "sha256": "14bb8dfb35c0ffdea7bc01e56cea38b9e3d5efcdcb9c251d6b40538e1aab555a"},
+            {"name": "model.bin", "size": 1381827087, "sha256": "72d7533dc7a0e8f10f19a650d4e90faf9cbfa899db5411ad124bd5802bd91263"},
+        ],
         "approx_size_mb": 1300,
         "is_multilingual": True,
         "model_type": "nllb",
@@ -2135,6 +2215,13 @@ RECOMMENDED_MODELS = [
         "id": "google-madlad400-3b",
         "name": _("Google MADLAD-400 (3B - Ultra Multilingual ~2.9 GB)"),
         "repo": "Heng666/madlad400-3b-mt-ct2-int8",
+        "revision": "b963b846ca4a5c106b7c64b863802599993e5f3b",
+        "files": [
+            {"name": "config.json", "size": 224, "git_sha1": "582af3144634f98327a9c4c4187fd7aa034d7c7f"},
+            {"name": "shared_vocabulary.json", "size": 5477099, "git_sha1": "2a0954b3566298446fcd39a117e8a3a860bf525a"},
+            {"name": "spiece.model", "size": 4427844, "sha256": "ef11ac9a22c7503492f56d48dce53be20e339b63605983e9f27d2cd0e0f3922c"},
+            {"name": "model.bin", "size": 2950208329, "sha256": "77b9fd9ab97c1259d07089b5f854393dad81bc5fb5647d3f9a5d101c94f40daa"},
+        ],
         "approx_size_mb": 2950,
         "is_multilingual": True,
         "model_type": "madlad",
@@ -2151,6 +2238,8 @@ def get_installed_offline_models():
     if os.path.exists(MODELS_DIR):
         for item in os.listdir(MODELS_DIR):
             item_path = os.path.join(MODELS_DIR, item)
+            if item.endswith((MODEL_STAGING_SUFFIX, MODEL_BACKUP_SUFFIX)):
+                continue
             if os.path.isdir(item_path):
                 # Ensure directory contains valid model weights
                 if os.path.isfile(os.path.join(item_path, "model.bin")):
@@ -2356,6 +2445,9 @@ def delete_installed_model(model_id):
             return False
 
     _MODEL_LANG_CACHE.pop(clean_id, None)
+    clear_offline_cache(clean_id)
+    if not is_model_downloading(clean_id):
+        shutil.rmtree(model_dir + MODEL_STAGING_SUFFIX, ignore_errors=True)
     if os.path.exists(model_dir):
         try:
             unload_engine(model_dir)
@@ -2446,10 +2538,203 @@ def get_model_supported_languages(model_id):
     return res
 
 
+# Verified Model Download
+# Every catalog model is pinned to an exact Hugging Face commit and a per-file size + hash manifest
+# (SHA-256 for Git LFS files, Git blob SHA-1 for regular files). Files download into a staging folder
+# "<id>.downloading", resume after interruptions via HTTP Range, are verified before use, and only then
+# replace the installed model in one rename. A failed or tampered download never touches a working model.
+MODEL_STAGING_SUFFIX = ".downloading"
+MODEL_BACKUP_SUFFIX = ".replaced"
+TOKENIZER_FILENAMES = ("source.spm", "spm.model", "sentencepiece.bpe.model", "spiece.model", "sentencepiece.model", "opus.spm")
+DOWNLOAD_READ_TIMEOUT_SECONDS = 30
+DOWNLOAD_MAX_ATTEMPTS_PER_FILE = 4
+DOWNLOAD_DISK_MARGIN_BYTES = 256 * 1024 * 1024
+DOWNLOAD_PROGRESS_STEP_PERCENT = 10
+_DOWNLOAD_LOCK = threading.Lock()
+_ACTIVE_DOWNLOADS = set()
+_SAFE_FILE_NAME_RE = re.compile(r'^[A-Za-z0-9_][A-Za-z0-9_.-]*$')
+_HEX40_RE = re.compile(r'^[0-9a-f]{40}$')
+_HEX64_RE = re.compile(r'^[0-9a-f]{64}$')
+
+
+class ModelIntegrityError(Exception):
+    """A downloaded model file does not match its pinned size or hash."""
+
+
+def is_model_downloading(model_id=None):
+    """True if the given model (or, with no argument, any model) is currently downloading."""
+    with _DOWNLOAD_LOCK:
+        return bool(_ACTIVE_DOWNLOADS) if model_id is None else model_id in _ACTIVE_DOWNLOADS
+
+
+def _validate_model_manifest(model_info):
+    """Returns (revision, files) for a well-formed pinned manifest, or None if the model cannot be verified."""
+    revision = str(model_info.get("revision", "") or "").strip().lower()
+    files = model_info.get("files")
+    if not _HEX40_RE.match(revision) or not isinstance(files, (list, tuple)) or not files:
+        return None
+    clean = []
+    for spec in files:
+        if not isinstance(spec, dict):
+            return None
+        name = str(spec.get("name", ""))
+        size = spec.get("size")
+        sha256 = str(spec.get("sha256", "") or "").lower()
+        git_sha1 = str(spec.get("git_sha1", "") or "").lower()
+        if not _SAFE_FILE_NAME_RE.match(name) or ".." in name or not isinstance(size, int) or size <= 0:
+            return None
+        if sha256:
+            if not _HEX64_RE.match(sha256):
+                return None
+            clean.append({"name": name, "size": size, "sha256": sha256, "git_sha1": None})
+        elif _HEX40_RE.match(git_sha1):
+            clean.append({"name": name, "size": size, "sha256": None, "git_sha1": git_sha1})
+        else:
+            return None
+    names = {spec["name"] for spec in clean}
+    if "model.bin" not in names or not names.intersection(TOKENIZER_FILENAMES):
+        return None
+    return revision, clean
+
+
+def _new_file_hasher(spec):
+    if spec["sha256"]:
+        return hashlib.sha256()
+    hasher = hashlib.sha1()
+    hasher.update(b"blob %d\0" % spec["size"])
+    return hasher
+
+
+def _file_matches_spec(path, spec):
+    """Verifies exact size and hash of a file on disk against its manifest entry."""
+    try:
+        if os.path.getsize(path) != spec["size"]:
+            return False
+        hasher = _new_file_hasher(spec)
+        with open(path, "rb") as f:
+            for block in iter(lambda: f.read(1024 * 1024), b""):
+                hasher.update(block)
+        return hasher.hexdigest() == (spec["sha256"] or spec["git_sha1"])
+    except OSError:
+        return False
+
+
+def _staged_bytes(staging_dir, files):
+    """Bytes already present in the staging folder (complete files and resumable .part files)."""
+    total = 0
+    for spec in files:
+        for candidate in (os.path.join(staging_dir, spec["name"]), os.path.join(staging_dir, spec["name"] + ".part")):
+            try:
+                total += min(os.path.getsize(candidate), spec["size"])
+                break
+            except OSError:
+                continue
+    return total
+
+
+def _remove_quietly(path):
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def _download_verified_file(url, dest_path, spec, on_bytes):
+    """Downloads one file with resume support and verifies it before moving it into place."""
+    if os.path.isfile(dest_path):
+        if _file_matches_spec(dest_path, spec):
+            return
+        on_bytes(-min(os.path.getsize(dest_path), spec["size"]))
+        os.remove(dest_path)
+
+    part_path = dest_path + ".part"
+    expected = spec["size"]
+    for attempt in range(1, DOWNLOAD_MAX_ATTEMPTS_PER_FILE + 1):
+        offset = os.path.getsize(part_path) if os.path.isfile(part_path) else 0
+        if offset > expected:
+            _remove_quietly(part_path)
+            offset = 0
+        if offset == expected:
+            break
+        headers = {"User-Agent": "OmniTranslate-NVDA"}
+        if offset:
+            headers["Range"] = f"bytes={offset}-"
+        req = urllib.request.Request(url, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=DOWNLOAD_READ_TIMEOUT_SECONDS) as res:
+                if urllib.parse.urlparse(res.geturl()).scheme.lower() != "https":
+                    raise ModelIntegrityError(f"{spec['name']}: download was redirected to a non-HTTPS address")
+                if offset and getattr(res, "status", 200) != 206:
+                    on_bytes(-offset)  # server ignored the Range request: start this file over
+                    offset = 0
+                written = offset
+                with open(part_path, "ab" if offset else "wb") as out_file:
+                    while True:
+                        block = res.read(512 * 1024)
+                        if not block:
+                            break
+                        written += len(block)
+                        if written > expected:
+                            raise ModelIntegrityError(f"{spec['name']}: file is larger than expected")
+                        out_file.write(block)
+                        on_bytes(len(block))
+            if written == expected:
+                break
+        except ModelIntegrityError:
+            _remove_quietly(part_path)
+            raise
+        except urllib.error.HTTPError as he:
+            if he.code in (401, 403, 404, 410):
+                raise
+            if he.code == 416:
+                on_bytes(-offset)
+                _remove_quietly(part_path)
+            if attempt == DOWNLOAD_MAX_ATTEMPTS_PER_FILE:
+                raise
+        except (urllib.error.URLError, http.client.HTTPException, OSError):
+            if attempt == DOWNLOAD_MAX_ATTEMPTS_PER_FILE:
+                raise
+        logHandler.log.debug(f"OmniTranslate: retrying download of {spec['name']} (attempt {attempt + 1})")
+        time.sleep(min(10, 2 * attempt))
+
+    if not _file_matches_spec(part_path, spec):
+        _remove_quietly(part_path)
+        raise ModelIntegrityError(f"{spec['name']}: size or checksum does not match the pinned value")
+    os.replace(part_path, dest_path)
+
+
+def _install_staged_model(staging_dir, target_dir, model_id):
+    """Atomically replaces the installed model folder with the verified staging folder.
+    Restores the previous model if the swap fails."""
+    backup_dir = None
+    with _ENGINE_LOCK:
+        if os.path.exists(target_dir):
+            if _ACTIVE_TRANSLATIONS.get(_normalize_model_path(target_dir), 0) > 0:
+                raise Exception(_("The model is in use. Try again after the current translation finishes."))
+            unload_engine(target_dir)
+            backup_dir = target_dir + MODEL_BACKUP_SUFFIX
+            shutil.rmtree(backup_dir, ignore_errors=True)
+            os.replace(target_dir, backup_dir)
+        try:
+            os.replace(staging_dir, target_dir)
+        except Exception:
+            if backup_dir and os.path.exists(backup_dir) and not os.path.exists(target_dir):
+                os.replace(backup_dir, target_dir)
+            raise
+    if backup_dir:
+        shutil.rmtree(backup_dir, ignore_errors=True)
+    _MODEL_LANG_CACHE.pop(model_id, None)
+    clear_offline_cache(model_id)
+
+
 def download_model_package(model_info, on_complete=None):
-    """Downloads CTranslate2 model package with live progress."""
+    """Downloads a pinned, integrity-verified CTranslate2 model package with live progress and resume."""
     if getattr(globalVars.appArgs, "secure", False) or getattr(globalVars.appArgs, "secureMode", False):
         wx.CallAfter(ui.message, _("Model download is disabled on secure screens."))
+        return
+
+    if not IS_64BIT_RUNTIME:
+        wx.CallAfter(ui.message, _("Offline translation requires 64-bit NVDA (version 2026.1 or later). The model was not downloaded."))
         return
 
     model_id = str(model_info.get("id", "nllb-200-600m")).strip()
@@ -2467,114 +2752,109 @@ def download_model_package(model_info, on_complete=None):
     if not re.match(r'^[a-zA-Z0-9_\.-]+/[a-zA-Z0-9_\.-]+$', repo_name) or ".." in repo_name:
         logHandler.log.error(f"OmniTranslate: Invalid repo name for download: {repo_name}")
         return
-    base_url = f"https://huggingface.co/{repo_name}/resolve/main/"
 
-    files_to_download = [
-        ("config.json", False),
-        ("shared_vocabulary.txt", False),
-        ("shared_vocabulary.json", False),
-        ("sentencepiece.bpe.model", False),
-        ("source.spm", False),
-        ("spm.model", False),
-        ("spiece.model", False),
-        ("sentencepiece.model", False),
-        ("opus.spm", False),
-        ("model.bin", True)
-    ]
+    manifest = _validate_model_manifest(model_info)
+    if not manifest:
+        logHandler.log.error(f"OmniTranslate: Refusing download of '{model_id}': no valid pinned revision and file checksums.")
+        wx.CallAfter(ui.message, _("This model has no verified file list and cannot be downloaded safely."))
+        return
+    revision, files = manifest
+
+    with _DOWNLOAD_LOCK:
+        if model_id in _ACTIVE_DOWNLOADS:
+            wx.CallAfter(ui.message, _("{name} is already downloading.").format(name=model_info["name"]))
+            return
+        _ACTIVE_DOWNLOADS.add(model_id)
+
+    staging_dir = target_dir + MODEL_STAGING_SUFFIX
+    base_url = f"https://huggingface.co/{repo_name}/resolve/{revision}/"
 
     def _worker():
         try:
-            if not os.path.exists(target_dir):
-                os.makedirs(target_dir)
+            os.makedirs(staging_dir, exist_ok=True)
+            total_bytes = sum(spec["size"] for spec in files)
+            already = _staged_bytes(staging_dir, files)
+            needed = (total_bytes - already) + DOWNLOAD_DISK_MARGIN_BYTES
+            free = shutil.disk_usage(MODELS_DIR).free
+            if free < needed:
+                raise Exception(_("Not enough disk space: {need:.0f} MB needed, {free:.0f} MB available").format(
+                    need=needed / (1024 * 1024), free=free / (1024 * 1024)
+                ))
 
-            wx.CallAfter(ui.message, _("Connecting to download {name}...").format(
-                name=model_info["name"]
-            ))
+            if already:
+                wx.CallAfter(ui.message, _("Resuming download of {name}...").format(name=model_info["name"]))
+            else:
+                wx.CallAfter(ui.message, _("Connecting to download {name}...").format(name=model_info["name"]))
 
-            total_downloaded_bytes = 0
+            progress = {"done": already, "last_pct": int(already * 100 / total_bytes) if total_bytes else 0}
 
-            for fname, is_required in files_to_download:
-                file_url = base_url + fname
-                dest_path = os.path.join(target_dir, fname)
-                req = urllib.request.Request(
-                    file_url,
-                    headers={'User-Agent': 'Mozilla/5.0 OmniTranslate-NVDA'}
-                )
+            def _on_bytes(count):
+                progress["done"] = max(0, progress["done"] + count)
+                if total_bytes <= 0 or count <= 0:
+                    return
+                pct = int(progress["done"] * 100 / total_bytes)
+                if pct - progress["last_pct"] >= DOWNLOAD_PROGRESS_STEP_PERCENT:
+                    progress["last_pct"] = pct
+                    msg = _("Downloading {name}: {pct}% ({done_mb:.1f} MB / {total_mb:.1f} MB)").format(
+                        name=model_info["name"],
+                        pct=pct,
+                        done_mb=progress["done"] / (1024 * 1024),
+                        total_mb=total_bytes / (1024 * 1024)
+                    )
+                    wx.CallAfter(ui.message, msg)
 
-                try:
-                    with urllib.request.urlopen(req, timeout=25) as res:
-                        content_len = res.headers.get('Content-Length')
-                        file_total = int(content_len) if content_len else 0
-                        file_done = 0
-                        last_pct = 0
+            for spec in files:
+                _download_verified_file(base_url + spec["name"], os.path.join(staging_dir, spec["name"]), spec, _on_bytes)
 
-                        part_path = dest_path + ".part"
-                        with open(part_path, "wb") as out_file:
-                            while True:
-                                chunk = res.read(1024 * 512)
-                                if not chunk:
-                                    break
-                                out_file.write(chunk)
-                                file_done += len(chunk)
-                                total_downloaded_bytes += len(chunk)
-
-                                if file_total > 5 * 1024 * 1024:
-                                    pct = int((file_done / file_total) * 100)
-                                    if pct - last_pct >= 20:
-                                        last_pct = pct
-                                        done_mb = file_done / (1024 * 1024)
-                                        total_mb = file_total / (1024 * 1024)
-                                        msg = _("Downloading {name}: {pct}% ({done_mb:.1f} MB / {total_mb:.1f} MB)").format(
-                                             name=model_info["name"],
-                                             pct=pct,
-                                             done_mb=done_mb,
-                                             total_mb=total_mb
-                                         )
-                                        wx.CallAfter(ui.message, msg)
-                        os.replace(part_path, dest_path)
-                except urllib.error.HTTPError as he:
-                    if is_required:
-                        raise he
-                except Exception as e:
-                    if is_required:
-                        raise e
-                    continue
-
-            # Verify that essential model files (model.bin and at least one tokenizer) were downloaded successfully
-            has_tokenizer = any(
-                os.path.isfile(os.path.join(target_dir, sp_name))
-                for sp_name in ("source.spm", "spm.model", "sentencepiece.bpe.model", "spiece.model", "sentencepiece.model", "opus.spm")
-            )
-            if not os.path.isfile(os.path.join(target_dir, "model.bin")) or not has_tokenizer:
-                raise Exception(_("Model package is incomplete: missing weights or tokenizer."))
-
-            with open(os.path.join(target_dir, "model_info.json"), "w", encoding="utf-8") as f:
+            with open(os.path.join(staging_dir, "model_info.json"), "w", encoding="utf-8") as f:
                 json.dump(model_info, f, ensure_ascii=False, indent=2)
 
-            total_mb = total_downloaded_bytes / (1024 * 1024)
-            logHandler.log.info(f"OmniTranslate: Model '{model_id}' successfully downloaded and verified ({total_mb:.1f} MB).")
+            wx.CallAfter(ui.message, _("Download verified. Installing {name}...").format(name=model_info["name"]))
+            _install_staged_model(staging_dir, target_dir, model_id)
+
+            total_mb = total_bytes / (1024 * 1024)
+            logHandler.log.info(f"OmniTranslate: Model '{model_id}' downloaded, checksum-verified at revision {revision[:12]} and installed ({total_mb:.1f} MB).")
             wx.CallAfter(tones.beep, 880, 50)
             wx.CallAfter(ui.message, _("Installation complete: {name} ({total_mb:.1f} MB) is ready.").format(
                 name=model_info["name"],
                 total_mb=total_mb
             ))
 
-            _MODEL_LANG_CACHE.pop(model_id, None)
-
             if on_complete:
                 on_complete(model_id)
 
+        except ModelIntegrityError as e:
+            logHandler.log.error(f"OmniTranslate: Model download failed verification: {e}")
+            wx.CallAfter(tones.beep, 200, 70)
+            wx.CallAfter(ui.message, _("Model download failed verification and the damaged file was discarded: {error}").format(error=str(e)))
         except Exception as e:
+            # The staging folder is kept so pressing Download again resumes; an installed model is never touched.
             logHandler.log.error(f"OmniTranslate: Error downloading model: {e}")
-            # Clean up incomplete model folder so corrupted weights are not loaded
-            try:
-                shutil.rmtree(target_dir, ignore_errors=True)
-            except Exception:
-                pass
-            err_msg = _("Model download failed: {error}").format(error=str(e))
-            wx.CallAfter(ui.message, err_msg)
+            wx.CallAfter(ui.message, _("Model download failed: {error}. Press Download again to resume.").format(error=str(e)))
+        finally:
+            with _DOWNLOAD_LOCK:
+                _ACTIVE_DOWNLOADS.discard(model_id)
 
     threading.Thread(target=_worker, daemon=True).start()
+
+# Inference Resource Guards
+# One inference at a time, bounded batches and a spare CPU core keep NVDA speech responsive and
+# prevent long documents (or the 3B model) from exhausting RAM inside NVDA's process.
+_INFERENCE_LOCK = threading.Lock()
+MAX_BATCH_SIZE_STANDARD = 16
+MAX_BATCH_SIZE_LARGE_MODEL = 6
+MAX_INFERENCE_THREADS = 8
+
+
+def _inference_thread_count():
+    cores = os.cpu_count() or 2
+    return max(1, min(cores - 1, MAX_INFERENCE_THREADS))
+
+
+def _inference_batch_size(model_id, supp_info=None):
+    mid = (model_id or "").lower()
+    is_large = "madlad" in mid or "3b" in mid or (supp_info or {}).get("model_type") == "madlad"
+    return MAX_BATCH_SIZE_LARGE_MODEL if is_large else MAX_BATCH_SIZE_STANDARD
 
 
 def get_loaded_engine(model_dir):
@@ -2611,7 +2891,13 @@ def get_loaded_engine(model_dir):
                 return None
 
             sp_processor = spm.SentencePieceProcessor(model_file=sp_path)
-            translator = ctranslate2.Translator(model_dir, device="cpu", compute_type="auto")
+            translator = ctranslate2.Translator(
+                model_dir,
+                device="cpu",
+                compute_type="auto",
+                inter_threads=1,
+                intra_threads=_inference_thread_count()
+            )
 
             engine = {
                 "sp": sp_processor,
@@ -2992,6 +3278,14 @@ def translate_offline(text, model_id, src_lang="en", tgt_lang="th"):
     if not text or not isinstance(text, str) or not text.strip():
         return ""
 
+    cached = _get_offline_from_cache(text, model_id, src_lang, tgt_lang)
+    if cached:
+        record_offline_activity()
+        return cached
+
+    if not IS_64BIT_RUNTIME:
+        raise Exception(_("Offline translation requires 64-bit NVDA (version 2026.1 or later)."))
+
     model_dir = os.path.join(MODELS_DIR, model_id)
     if not os.path.exists(model_dir):
         raise Exception(_("Model directory not found: ") + model_id)
@@ -3069,15 +3363,18 @@ def translate_offline(text, model_id, src_lang="en", tgt_lang="th"):
                 "beam_size": 4,
                 "repetition_penalty": 1.12,
                 "no_repeat_ngram_size": 0,
-                "max_decoding_length": max_dec
+                "max_decoding_length": max_dec,
+                "max_batch_size": _inference_batch_size(model_id, supp_info),
+                "batch_type": "examples"
             }
             if target_prefix is not None:
                 translate_kwargs["target_prefix"] = target_prefix
 
-            results = translator.translate_batch(
-                batch_inputs,
-                **translate_kwargs
-            )
+            with _INFERENCE_LOCK:
+                results = translator.translate_batch(
+                    batch_inputs,
+                    **translate_kwargs
+                )
 
             output_lines = []
             for line_idx, orig_line in enumerate(lines):
@@ -3100,7 +3397,9 @@ def translate_offline(text, model_id, src_lang="en", tgt_lang="th"):
                     line_parts.append(lead_space + final_trans + sent_delim)
                 output_lines.append("".join(line_parts))
 
-            return "\r\n".join(output_lines)
+            final_res = "\r\n".join(output_lines)
+            _put_offline_to_cache(text, model_id, src_lang, tgt_lang, final_res)
+            return final_res
 
         else:
             # Bilingual Pair Mode (Opus-MT / Marian / Custom Pair)
@@ -3135,13 +3434,16 @@ def translate_offline(text, model_id, src_lang="en", tgt_lang="th"):
                 return text
 
             max_dec = max(128, int(max_raw_len * 4) + 64)
-            results = translator.translate_batch(
-                batch_inputs,
-                beam_size=4,
-                repetition_penalty=1.12,
-                no_repeat_ngram_size=0,
-                max_decoding_length=max_dec
-            )
+            with _INFERENCE_LOCK:
+                results = translator.translate_batch(
+                    batch_inputs,
+                    beam_size=4,
+                    repetition_penalty=1.12,
+                    no_repeat_ngram_size=0,
+                    max_decoding_length=max_dec,
+                    max_batch_size=_inference_batch_size(model_id, supp_info),
+                    batch_type="examples"
+                )
 
             output_lines = []
             for line_idx, orig_line in enumerate(lines):
@@ -3161,7 +3463,9 @@ def translate_offline(text, model_id, src_lang="en", tgt_lang="th"):
                     line_parts.append(lead_space + final_trans + sent_delim)
                 output_lines.append("".join(line_parts))
 
-            return "\r\n".join(output_lines)
+            final_res = "\r\n".join(output_lines)
+            _put_offline_to_cache(text, model_id, src_lang, tgt_lang, final_res)
+            return final_res
 
     except Exception as e:
         logHandler.log.error(f"OmniTranslate: Translation execution error: {e}")

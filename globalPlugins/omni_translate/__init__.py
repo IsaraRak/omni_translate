@@ -8,13 +8,21 @@ import ui
 import api
 import textInfos
 import threading
+import concurrent.futures
 import time
 import ctypes
 import json
+import gzip
 import os
 import re
 import urllib.request
 import urllib.parse
+import urllib.error
+import http.client
+import io
+import socket
+import ssl
+import errno
 import html
 import wx
 import gui
@@ -39,6 +47,66 @@ if hasattr(addonHandler, "installAddonBundle") and not hasattr(addonHandler, "in
         addonHandler.installAddonPackage = addonHandler.installAddonBundle
     except Exception:
         pass
+
+
+# Private Win32 DLL Instances with Explicit 64-bit-Safe Prototypes
+# _user32 / kernel32 are process-wide objects shared with NVDA core and other add-ons;
+# setting argtypes/restype on them changes behaviour for everyone. OmniTranslate uses its own
+# ctypes.WinDLL instances instead, with prototypes declared once so handles and pointer-sized
+# values are never truncated on 64-bit NVDA (2026.1+).
+def _load_win_dll(name):
+    try:
+        return ctypes.WinDLL(name, use_last_error=True)
+    except Exception:
+        return None
+
+
+_user32 = _load_win_dll("user32")
+_kernel32 = _load_win_dll("kernel32")
+
+
+def _configure_win32_prototypes():
+    c = ctypes
+    prototypes = (
+        (_user32, "OpenClipboard", [c.c_void_p], c.c_int),
+        (_user32, "CloseClipboard", [], c.c_int),
+        (_user32, "EmptyClipboard", [], c.c_int),
+        (_user32, "EnumClipboardFormats", [c.c_uint], c.c_uint),
+        (_user32, "GetClipboardData", [c.c_uint], c.c_void_p),
+        (_user32, "SetClipboardData", [c.c_uint, c.c_void_p], c.c_void_p),
+        (_user32, "IsClipboardFormatAvailable", [c.c_uint], c.c_int),
+        (_user32, "GetClipboardSequenceNumber", [], c.c_uint),
+        (_user32, "RegisterClipboardFormatW", [c.c_wchar_p], c.c_uint),
+        (_user32, "GetForegroundWindow", [], c.c_void_p),
+        (_user32, "GetClassNameW", [c.c_void_p, c.c_wchar_p, c.c_int], c.c_int),
+        (_user32, "GetWindowLongW", [c.c_void_p, c.c_int], c.c_long),
+        (_user32, "SendMessageW", [c.c_void_p, c.c_uint, c.c_size_t, c.c_ssize_t], c.c_ssize_t),
+        (_user32, "SendMessageTimeoutW", [c.c_void_p, c.c_uint, c.c_size_t, c.c_ssize_t, c.c_uint, c.c_uint, c.POINTER(c.c_size_t)], c.c_ssize_t),
+        (_user32, "GetAsyncKeyState", [c.c_int], c.c_short),
+        (_user32, "MapVirtualKeyW", [c.c_uint, c.c_uint], c.c_uint),
+        (_user32, "keybd_event", [c.c_ubyte, c.c_ubyte, c.c_uint, c.c_size_t], None),
+        (_kernel32, "GlobalAlloc", [c.c_uint, c.c_size_t], c.c_void_p),
+        (_kernel32, "GlobalLock", [c.c_void_p], c.c_void_p),
+        (_kernel32, "GlobalUnlock", [c.c_void_p], c.c_int),
+        (_kernel32, "GlobalSize", [c.c_void_p], c.c_size_t),
+        (_kernel32, "GlobalFree", [c.c_void_p], c.c_void_p),
+    )
+    for dll, func_name, argtypes, restype in prototypes:
+        if dll is None:
+            continue
+        try:
+            func = getattr(dll, func_name)
+            func.argtypes = argtypes
+            func.restype = restype
+        except Exception:
+            pass
+
+
+_configure_win32_prototypes()
+
+
+class _TranslationSuperseded(Exception):
+    """Raised inside a translation job when a newer translation request has replaced it."""
 
 
 def is_secure_mode():
@@ -91,16 +159,424 @@ def is_html_error_response(content):
     return False
 
 
+# In-Memory Thread-Safe LRU + TTL Translation Cache (30 min TTL, 500 items max)
+_TRANSLATION_CACHE = {}
+_CACHE_LOCK = threading.Lock()
+CACHE_TTL_SECONDS = 1800
+MAX_CACHE_ENTRIES = 500
+
+
+def _get_from_cache(text, sl, tl):
+    if not text or not isinstance(text, str):
+        return None
+    key = (text.strip(), normalize_lang(sl), normalize_lang(tl))
+    now = time.time()
+    with _CACHE_LOCK:
+        if key in _TRANSLATION_CACHE:
+            trans, det, ts = _TRANSLATION_CACHE[key]
+            if now - ts <= CACHE_TTL_SECONDS:
+                _TRANSLATION_CACHE[key] = (trans, det, now)
+                return trans, det
+            else:
+                del _TRANSLATION_CACHE[key]
+    return None
+
+
+def _put_to_cache(text, sl, tl, translated_text, detected_src):
+    if not text or not translated_text or not isinstance(text, str) or not isinstance(translated_text, str):
+        return
+    key = (text.strip(), normalize_lang(sl), normalize_lang(tl))
+    now = time.time()
+    with _CACHE_LOCK:
+        if len(_TRANSLATION_CACHE) >= MAX_CACHE_ENTRIES and key not in _TRANSLATION_CACHE:
+            oldest_key = min(_TRANSLATION_CACHE, key=lambda k: _TRANSLATION_CACHE[k][2])
+            del _TRANSLATION_CACHE[oldest_key]
+        _TRANSLATION_CACHE[key] = (translated_text, detected_src, now)
+
+
+# Online Endpoint Health Tracker & Circuit Breaker
+# Keeps the free Google endpoints stable: pauses endpoints that are rate-limited,
+# detects an unreachable network immediately, and bounds the total wait per chunk,
+# so failures route to the offline engine in about a second instead of 12+ seconds.
+class OnlineUnavailableError(Exception):
+    """Raised when online translation cannot complete (network unreachable,
+    every endpoint cooling down, or all endpoints failed). Callers treat it as
+    the signal to route straight to the offline engine."""
+
+
+class GoogleErrorPageError(Exception):
+    """Google returned an anti-abuse / CAPTCHA / server error page instead of a translation."""
+
+
+_HEALTH_LOCK = threading.Lock()
+_ENDPOINT_COOLDOWN_UNTIL = {}
+_ENDPOINT_FAIL_COUNT = {}
+_NETWORK_DOWN_UNTIL = 0.0
+_LAST_FALLBACK_NOTICE_TIME = float("-inf")
+NETWORK_DOWN_COOLDOWN_SECONDS = 20.0
+RATE_LIMIT_DEFAULT_COOLDOWN_SECONDS = 300.0
+RATE_LIMIT_MIN_COOLDOWN_SECONDS = 30.0
+RATE_LIMIT_MAX_COOLDOWN_SECONDS = 900.0
+ENDPOINT_FAILURE_THRESHOLD = 2
+ENDPOINT_FAILURE_COOLDOWN_SECONDS = 60.0
+ONLINE_CHUNK_TIME_BUDGET_SECONDS = 8.0
+# Long texts take longer for Google to translate, so per-attempt timeouts and the per-chunk budget grow
+# with length; a slow answer for a long text is never treated as "network down".
+TIMEOUT_PER_1000_CHARS_SECONDS = 1.0
+MAX_ATTEMPT_TIMEOUT_SECONDS = 8.0
+BUDGET_PER_1000_CHARS_SECONDS = 2.0
+MAX_CHUNK_TIME_BUDGET_SECONDS = 20.0
+LONG_TEXT_TIMEOUT_THRESHOLD_CHARS = 500
+MIN_ATTEMPT_TIMEOUT_SECONDS = 0.75
+MAX_GET_URL_LENGTH = 4000
+MAX_CONCURRENT_LINE_REQUESTS = 3
+MAX_PARALLEL_CHUNKS = 3
+FALLBACK_NOTICE_INTERVAL_SECONDS = 15.0
+_NETWORK_DOWN_ERROR_CODES = {
+    errno.ENETDOWN, errno.ENETUNREACH, errno.EHOSTUNREACH, errno.ECONNREFUSED,
+    10050, 10051, 10061, 10065,  # WSAENETDOWN, WSAENETUNREACH, WSAECONNREFUSED, WSAEHOSTUNREACH
+}
+
+# (endpoint name, per-attempt timeout in seconds, sends text in the URL via GET)
+_ONLINE_ENDPOINTS = (
+    ("gtx", 3.0, False),
+    ("clients5", 3.0, True),
+    ("dict-chrome-ex", 3.0, False),
+    ("web", 3.5, True),
+)
+
+
+def reset_online_health():
+    """Clears all endpoint cooldowns and the network-down flag (used when the user switches to Online mode)."""
+    global _NETWORK_DOWN_UNTIL
+    with _HEALTH_LOCK:
+        _ENDPOINT_COOLDOWN_UNTIL.clear()
+        _ENDPOINT_FAIL_COUNT.clear()
+        _NETWORK_DOWN_UNTIL = 0.0
+
+
+def is_network_down():
+    with _HEALTH_LOCK:
+        return time.monotonic() < _NETWORK_DOWN_UNTIL
+
+
+def _mark_network_down():
+    global _NETWORK_DOWN_UNTIL
+    with _HEALTH_LOCK:
+        _NETWORK_DOWN_UNTIL = time.monotonic() + NETWORK_DOWN_COOLDOWN_SECONDS
+
+
+def _is_endpoint_available(name):
+    with _HEALTH_LOCK:
+        until = _ENDPOINT_COOLDOWN_UNTIL.get(name)
+        if until is None:
+            return True
+        if time.monotonic() >= until:
+            del _ENDPOINT_COOLDOWN_UNTIL[name]
+            _ENDPOINT_FAIL_COUNT.pop(name, None)
+            return True
+        return False
+
+
+def _record_endpoint_success(name):
+    with _HEALTH_LOCK:
+        _ENDPOINT_FAIL_COUNT.pop(name, None)
+        _ENDPOINT_COOLDOWN_UNTIL.pop(name, None)
+
+
+def _parse_retry_after(err):
+    try:
+        value = err.headers.get("Retry-After") if getattr(err, "headers", None) else None
+        seconds = float(value) if value else RATE_LIMIT_DEFAULT_COOLDOWN_SECONDS
+    except Exception:
+        seconds = RATE_LIMIT_DEFAULT_COOLDOWN_SECONDS
+    return max(RATE_LIMIT_MIN_COOLDOWN_SECONDS, min(RATE_LIMIT_MAX_COOLDOWN_SECONDS, seconds))
+
+
+def _record_endpoint_failure(name, err):
+    """Records a failure. Rate-limit/CAPTCHA responses pause the endpoint immediately (honouring Retry-After);
+    other errors pause it after ENDPOINT_FAILURE_THRESHOLD consecutive failures. Returns the cooldown applied (0 if none)."""
+    is_blocked = isinstance(err, GoogleErrorPageError) or (
+        isinstance(err, urllib.error.HTTPError) and err.code in (403, 429, 503)
+    )
+    cooldown = _parse_retry_after(err) if is_blocked else 0.0
+    now = time.monotonic()
+    with _HEALTH_LOCK:
+        if is_blocked:
+            _ENDPOINT_COOLDOWN_UNTIL[name] = now + cooldown
+            _ENDPOINT_FAIL_COUNT.pop(name, None)
+            return cooldown
+        count = _ENDPOINT_FAIL_COUNT.get(name, 0) + 1
+        if count >= ENDPOINT_FAILURE_THRESHOLD:
+            _ENDPOINT_COOLDOWN_UNTIL[name] = now + ENDPOINT_FAILURE_COOLDOWN_SECONDS
+            _ENDPOINT_FAIL_COUNT.pop(name, None)
+            return ENDPOINT_FAILURE_COOLDOWN_SECONDS
+        _ENDPOINT_FAIL_COUNT[name] = count
+        return 0.0
+
+
+def _is_timeout_error(err):
+    if isinstance(err, (socket.timeout, TimeoutError)):
+        return True
+    return isinstance(err, urllib.error.URLError) and isinstance(getattr(err, "reason", None), (socket.timeout, TimeoutError))
+
+
+def _is_network_unreachable_error(err):
+    """True for failures meaning no Google endpoint can be reached from this machine right now:
+    DNS failure, network/host unreachable, connection refused, or TLS interception (captive portal)."""
+    if isinstance(err, urllib.error.HTTPError):
+        return False
+    reason = err.reason if isinstance(err, urllib.error.URLError) else err
+    if isinstance(reason, (socket.gaierror, ConnectionRefusedError, ssl.SSLCertVerificationError)):
+        return True
+    if isinstance(reason, OSError) and not isinstance(reason, TimeoutError):
+        codes = {getattr(reason, "errno", None), getattr(reason, "winerror", None)}
+        return bool(codes & _NETWORK_DOWN_ERROR_CODES)
+    return False
+
+
+def _attempt_timeout(base_timeout, text):
+    """Per-attempt timeout: the endpoint's base timeout plus 1s per 1,000 characters (max 8s)."""
+    return min(MAX_ATTEMPT_TIMEOUT_SECONDS, base_timeout + len(text or "") / 1000.0 * TIMEOUT_PER_1000_CHARS_SECONDS)
+
+
+def _chunk_time_budget(text):
+    """Total online budget for one chunk: 8s plus 2s per 1,000 characters (max 20s)."""
+    return min(MAX_CHUNK_TIME_BUDGET_SECONDS, ONLINE_CHUNK_TIME_BUDGET_SECONDS + len(text or "") / 1000.0 * BUDGET_PER_1000_CHARS_SECONDS)
+
+
+def _estimate_get_url_length(text, sl, tl):
+    return len(urllib.parse.quote(text or "")) + len(sl or "") + len(tl or "") + 120
+
+
+def _call_online_endpoint(name, text, sl, tl, timeout):
+    if name == "gtx":
+        return request_api_endpoint(text, sl, tl, "gtx", timeout=timeout)
+    if name == "clients5":
+        return request_clients5_endpoint(text, sl, tl, timeout=timeout)
+    if name == "dict-chrome-ex":
+        return request_api_endpoint(text, sl, tl, "dict-chrome-ex", timeout=timeout)
+    return request_web_fallback(text, sl, tl, timeout=timeout)
+
+
+def _announce_offline_fallback():
+    """Announces the offline fallback at most once per FALLBACK_NOTICE_INTERVAL_SECONDS
+    so multi-chunk documents do not repeat the tone and message for every chunk."""
+    global _LAST_FALLBACK_NOTICE_TIME
+    now = time.monotonic()
+    with _HEALTH_LOCK:
+        if now - _LAST_FALLBACK_NOTICE_TIME < FALLBACK_NOTICE_INTERVAL_SECONDS:
+            return
+        _LAST_FALLBACK_NOTICE_TIME = now
+    wx.CallAfter(tones.beep, 450, 40)
+    wx.CallAfter(ui.message, _("Online translation failed, falling back to offline model..."))
+
+
+def read_response_content(response):
+    raw_bytes = response.read()
+    if response.headers.get('Content-Encoding') == 'gzip' or (len(raw_bytes) >= 2 and raw_bytes[:2] == b'\x1f\x8b'):
+        try:
+            return gzip.decompress(raw_bytes).decode('utf-8')
+        except Exception:
+            pass
+    return raw_bytes.decode('utf-8', errors='replace')
+
+
 def get_headers():
     return {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
         'Accept': 'text/html,application/json,*/*',
         'Accept-Language': 'en-US,en;q=0.9,th;q=0.8',
+        'Accept-Encoding': 'gzip, deflate',
         'Referer': 'https://translate.google.com/'
     }
 
 
-def request_api_endpoint(text, sl, tl, client_type="gtx"):
+# Persistent HTTPS Connections & Warm-Up
+# urllib opens a new DNS + TCP + TLS connection for every request and sends "Connection: close".
+# OmniTranslate keeps a small pool of keep-alive HTTPS connections per Google host instead, and opens the
+# primary connection in the background as soon as NVDA+Shift+T is pressed, so the handshake is finished
+# by the time the second key arrives. Google closes idle connections, so pooled connections are only reused
+# for a short time; a connection that turns out to be closed is replaced and the request is resent once,
+# without counting as an endpoint failure. Proxy users and redirects keep the original urllib behaviour.
+HTTP_POOL_MAX_IDLE_PER_HOST = 3
+HTTP_POOL_MAX_IDLE_SECONDS = 45.0
+WARMUP_HOST = "translate.googleapis.com"
+WARMUP_WAIT_SECONDS = 1.5
+WARMUP_SKIP_IF_IDLE_UNDER_SECONDS = 20.0
+WARMUP_CONNECT_TIMEOUT_SECONDS = 3.0
+MAX_CONCURRENT_ONLINE_REQUESTS = 3
+PROXY_CHECK_INTERVAL_SECONDS = 60.0
+_ONLINE_REQUEST_SLOTS = threading.BoundedSemaphore(MAX_CONCURRENT_ONLINE_REQUESTS)
+_POOL_LOCK = threading.Lock()
+_IDLE_CONNECTIONS = {}
+_WARMUP_EVENTS = {}
+_SSL_CONTEXT = None
+_PROXY_STATE = {"checked": float("-inf"), "configured": False}
+_REQUEST_INFO = threading.local()
+_STALE_CONNECTION_ERRORS = (
+    http.client.BadStatusLine,  # includes RemoteDisconnected
+    http.client.CannotSendRequest,
+    http.client.ResponseNotReady,
+    ConnectionResetError,
+    ConnectionAbortedError,
+    BrokenPipeError,
+    ssl.SSLEOFError,          # TLS connection closed by the server while idle
+    ssl.SSLZeroReturnError,   # TLS close_notify received on an idle connection
+)
+
+
+def _get_ssl_context():
+    global _SSL_CONTEXT
+    if _SSL_CONTEXT is None:
+        _SSL_CONTEXT = ssl.create_default_context()
+    return _SSL_CONTEXT
+
+
+def _proxy_configured():
+    """True if Windows/system proxy settings apply to HTTPS; those users keep the urllib path, which honours them."""
+    now = time.monotonic()
+    if now - _PROXY_STATE["checked"] >= PROXY_CHECK_INTERVAL_SECONDS:
+        try:
+            proxies = urllib.request.getproxies()
+            _PROXY_STATE["configured"] = bool(proxies.get("https") or proxies.get("all"))
+        except Exception:
+            _PROXY_STATE["configured"] = True
+        _PROXY_STATE["checked"] = now
+    return _PROXY_STATE["configured"]
+
+
+def _close_quietly(conn):
+    try:
+        conn.close()
+    except Exception:
+        pass
+
+
+def _take_connection(host, timeout):
+    """Returns (connection, kind) where kind is "reused", "pre-warmed" or "new"."""
+    waited = False
+    while True:
+        with _POOL_LOCK:
+            idle = _IDLE_CONNECTIONS.get(host) or []
+            now = time.monotonic()
+            while idle:
+                conn, last_used = idle.pop()
+                if now - last_used <= HTTP_POOL_MAX_IDLE_SECONDS and conn.sock is not None:
+                    return conn, ("reused" if getattr(conn, "_omni_used", False) else "pre-warmed")
+                _close_quietly(conn)
+            event = _WARMUP_EVENTS.get(host)
+        if event is None or waited:
+            break
+        waited = True
+        event.wait(min(WARMUP_WAIT_SECONDS, timeout))
+    return http.client.HTTPSConnection(host, timeout=timeout, context=_get_ssl_context()), "new"
+
+
+def _return_connection(host, conn):
+    with _POOL_LOCK:
+        idle = _IDLE_CONNECTIONS.setdefault(host, [])
+        if len(idle) < HTTP_POOL_MAX_IDLE_PER_HOST:
+            idle.append((conn, time.monotonic()))
+            return
+    _close_quietly(conn)
+
+
+def close_online_connections():
+    """Closes every pooled connection (NVDA exit / add-on termination)."""
+    with _POOL_LOCK:
+        pooled = [conn for entries in _IDLE_CONNECTIONS.values() for conn, _last in entries]
+        _IDLE_CONNECTIONS.clear()
+    for conn in pooled:
+        _close_quietly(conn)
+
+
+def warm_up_online_connection():
+    """Opens the HTTPS connection to the primary Google endpoint in the background (no text is sent)."""
+    if is_secure_mode() or is_network_down() or _proxy_configured() or not _is_endpoint_available("gtx"):
+        return
+    host = WARMUP_HOST
+    with _POOL_LOCK:
+        if host in _WARMUP_EVENTS:
+            return
+        now = time.monotonic()
+        if any(now - last <= WARMUP_SKIP_IF_IDLE_UNDER_SECONDS for _conn, last in _IDLE_CONNECTIONS.get(host, [])):
+            return
+        event = threading.Event()
+        _WARMUP_EVENTS[host] = event
+
+    def _worker():
+        try:
+            conn = http.client.HTTPSConnection(host, timeout=WARMUP_CONNECT_TIMEOUT_SECONDS, context=_get_ssl_context())
+            started = time.monotonic()
+            conn.connect()
+            logHandler.log.debug(f"OmniTranslate: pre-warmed connection to {host} in {(time.monotonic() - started) * 1000:.0f} ms")
+            _return_connection(host, conn)
+        except Exception as e:
+            logHandler.log.debug(f"OmniTranslate: connection warm-up skipped: {e}")
+        finally:
+            with _POOL_LOCK:
+                _WARMUP_EVENTS.pop(host, None)
+            event.set()
+
+    threading.Thread(target=_worker, daemon=True).start()
+
+
+def _urllib_request(method, url, body, headers, timeout):
+    req = urllib.request.Request(url, data=body, headers=headers, method=method)
+    with urllib.request.urlopen(req, timeout=timeout) as response:
+        return read_response_content(response)
+
+
+def _https_request(method, url, body=None, headers=None, timeout=3.0):
+    """Performs an HTTPS request over a pooled keep-alive connection and returns the decoded body.
+    Raises urllib.error.HTTPError for HTTP 4xx/5xx, exactly like urllib, so failover logic is unchanged."""
+    headers = dict(headers or {})
+    if body is not None:
+        headers.setdefault("Content-Type", "application/x-www-form-urlencoded")
+    if _proxy_configured():
+        _REQUEST_INFO.kind = "proxy"
+        return _urllib_request(method, url, body, headers, timeout)
+
+    parsed = urllib.parse.urlsplit(url)
+    host = parsed.hostname
+    path = (parsed.path or "/") + ("?" + parsed.query if parsed.query else "")
+    for attempt in (1, 2):
+        conn, kind = _take_connection(host, timeout)
+        try:
+            conn.timeout = timeout
+            if conn.sock is not None:
+                conn.sock.settimeout(timeout)
+            conn.request(method, path, body=body, headers=headers)
+            response = conn.getresponse()
+            content = read_response_content(response)
+        except _STALE_CONNECTION_ERRORS as e:
+            _close_quietly(conn)
+            if kind != "new" and attempt == 1:
+                logHandler.log.debug(f"OmniTranslate: pooled connection to {host} was closed by the server ({e}); resending on a new connection")
+                continue
+            raise
+        except BaseException:
+            _close_quietly(conn)
+            raise
+        conn._omni_used = True
+        if response.will_close:
+            _close_quietly(conn)
+        else:
+            _return_connection(host, conn)
+        _REQUEST_INFO.kind = f"{kind} connection"
+        status = response.status
+        if 300 <= status < 400:
+            # Consent / "sorry" redirects: follow them exactly as before through urllib.
+            _REQUEST_INFO.kind = "redirect via urllib"
+            return _urllib_request(method, url, body, headers, timeout)
+        if status >= 400:
+            raise urllib.error.HTTPError(url, status, response.reason, response.headers, io.BytesIO(b""))
+        return content
+    raise http.client.RemoteDisconnected("connection closed")
+
+
+def request_api_endpoint(text, sl, tl, client_type="gtx", timeout=3.0):
     params = {
         'client': client_type,
         'sl': sl,
@@ -112,20 +588,18 @@ def request_api_endpoint(text, sl, tl, client_type="gtx"):
     }
     data = urllib.parse.urlencode(params).encode('utf-8')
     url = "https://translate.googleapis.com/translate_a/single"
-    req = urllib.request.Request(url, data=data, headers=get_headers())
-    with urllib.request.urlopen(req, timeout=5.0) as response:
-        raw_data = response.read().decode('utf-8')
-        if is_html_error_response(raw_data) and not is_html_error_response(text):
-            raise Exception("Google API returned infrastructure error page")
-        data = json.loads(raw_data)
-        translated_text = "".join([part[0] for part in data[0] if part and part[0]])
-        if is_html_error_response(translated_text) and not is_html_error_response(text):
-            raise Exception("Google API translation payload contains error page")
-        detected_src = data[2] if (isinstance(data, list) and len(data) > 2 and isinstance(data[2], str) and data[2]) else sl
-        return translated_text, detected_src
+    raw_data = _https_request("POST", url, body=data, headers=get_headers(), timeout=timeout)
+    if is_html_error_response(raw_data) and not is_html_error_response(text):
+        raise GoogleErrorPageError("Google API returned infrastructure error page")
+    data = json.loads(raw_data)
+    translated_text = "".join([part[0] for part in data[0] if part and part[0]])
+    if is_html_error_response(translated_text) and not is_html_error_response(text):
+        raise GoogleErrorPageError("Google API translation payload contains error page")
+    detected_src = data[2] if (isinstance(data, list) and len(data) > 2 and isinstance(data[2], str) and data[2]) else sl
+    return translated_text, detected_src
 
 
-def request_clients5_endpoint(text, sl, tl):
+def request_clients5_endpoint(text, sl, tl, timeout=3.0):
     params = {
         'client': 'dict-chrome-ex',
         'sl': sl,
@@ -133,59 +607,113 @@ def request_clients5_endpoint(text, sl, tl):
         'q': text
     }
     url = "https://clients5.google.com/translate_a/t?" + urllib.parse.urlencode(params)
-    req = urllib.request.Request(url, headers=get_headers())
-    with urllib.request.urlopen(req, timeout=5.0) as response:
-        raw_data = response.read().decode('utf-8')
-        if is_html_error_response(raw_data) and not is_html_error_response(text):
-            raise Exception("Google clients5 API returned infrastructure error page")
-        data = json.loads(raw_data)
-        if isinstance(data, list):
-            if data and isinstance(data[0], list):
-                translated_text = "".join([part[0] for part in data if isinstance(part, (list, tuple)) and part and part[0]])
-                detected_src = data[0][1] if len(data[0]) > 1 and isinstance(data[0][1], str) else sl
-                if is_html_error_response(translated_text) and not is_html_error_response(text):
-                    raise Exception("Google clients5 API translation payload contains error page")
-                return translated_text, detected_src
-            elif data and isinstance(data[0], str):
-                translated_text = "".join(data)
-                return translated_text, sl
-        elif isinstance(data, str):
-            return data, sl
-        raise Exception("Unexpected response format from clients5 endpoint")
+    raw_data = _https_request("GET", url, headers=get_headers(), timeout=timeout)
+    if is_html_error_response(raw_data) and not is_html_error_response(text):
+        raise GoogleErrorPageError("Google clients5 API returned infrastructure error page")
+    data = json.loads(raw_data)
+    if isinstance(data, list):
+        if data and isinstance(data[0], list):
+            translated_text = "".join([part[0] for part in data if isinstance(part, (list, tuple)) and part and part[0]])
+            detected_src = data[0][1] if len(data[0]) > 1 and isinstance(data[0][1], str) else sl
+            if is_html_error_response(translated_text) and not is_html_error_response(text):
+                raise GoogleErrorPageError("Google clients5 API translation payload contains error page")
+            return translated_text, detected_src
+        elif data and isinstance(data[0], str):
+            translated_text = "".join(data)
+            return translated_text, sl
+    elif isinstance(data, str):
+        return data, sl
+    raise Exception("Unexpected response format from clients5 endpoint")
 
 
-def request_web_fallback(text, sl, tl):
+def request_web_fallback(text, sl, tl, timeout=3.5):
     encoded_text = urllib.parse.quote(text)
     url = f"https://translate.google.com/m?sl={sl}&tl={tl}&hl=en&q={encoded_text}"
-    req = urllib.request.Request(url, headers=get_headers())
-    with urllib.request.urlopen(req, timeout=5.0) as response:
-        html_content = response.read().decode('utf-8', errors='ignore')
-        if is_html_error_response(html_content) and not is_html_error_response(text):
-            raise Exception("Google Web Engine returned infrastructure error page")
-        match = re.search(r'<div class="result-container">(.*?)</div>', html_content, re.DOTALL)
-        if match:
-            raw_html = match.group(1).replace('<br>', '\n').replace('<br/>', '\n')
-            translated_text = html.unescape(raw_html.strip())
-            if is_html_error_response(translated_text) and not is_html_error_response(text):
-                raise Exception("Google Web Engine translation payload contains error page")
-            return translated_text, sl
-        raise Exception("Unable to extract translation from Web Engine")
+    html_content = _https_request("GET", url, headers=get_headers(), timeout=timeout)
+    if is_html_error_response(html_content) and not is_html_error_response(text):
+        raise GoogleErrorPageError("Google Web Engine returned infrastructure error page")
+    match = re.search(r'<div class="result-container">(.*?)</div>', html_content, re.DOTALL)
+    if match:
+        raw_html = match.group(1).replace('<br>', '\n').replace('<br/>', '\n')
+        translated_text = html.unescape(raw_html.strip())
+        if is_html_error_response(translated_text) and not is_html_error_response(text):
+            raise GoogleErrorPageError("Google Web Engine translation payload contains error page")
+        return translated_text, sl
+    raise Exception("Unable to extract translation from Web Engine")
 
 
 def translate_single_chunk(text, sl, tl):
-    try:
-        return request_api_endpoint(text, sl, tl, "gtx")
-    except Exception as e:
-        logHandler.log.debug(f"OmniTranslate: gtx endpoint failed: {e}")
+    """Translates one chunk through the free Google endpoints with circuit-breaker protection.
+    Raises OnlineUnavailableError when online translation cannot complete, so the caller
+    can switch to the offline engine without further waiting."""
+    cached = _get_from_cache(text, sl, tl)
+    if cached:
+        return cached
+
+    if is_network_down():
+        raise OnlineUnavailableError("Network unreachable; online endpoints paused")
+
+    # At most MAX_CONCURRENT_ONLINE_REQUESTS chunks talk to Google at once (parallel document chunks and
+    # line-by-line fallback combined), keeping bursts below rate limits. The time budget starts after a slot is free.
+    with _ONLINE_REQUEST_SLOTS:
+        return _translate_chunk_via_endpoints(text, sl, tl)
+
+
+def _translate_chunk_via_endpoints(text, sl, tl):
+    if is_network_down():
+        raise OnlineUnavailableError("Network unreachable; online endpoints paused")
+    deadline = time.monotonic() + _chunk_time_budget(text)
+    url_too_long = _estimate_get_url_length(text, sl, tl) > MAX_GET_URL_LENGTH
+    is_long_text = len(text or "") > LONG_TEXT_TIMEOUT_THRESHOLD_CHARS
+    attempted = 0
+    timed_out = 0
+    empty_result = None
+    last_err = None
+
+    for name, base_timeout, uses_get in _ONLINE_ENDPOINTS:
+        if uses_get and url_too_long:
+            continue
+        if not _is_endpoint_available(name):
+            continue
+        remaining = deadline - time.monotonic()
+        if remaining < MIN_ATTEMPT_TIMEOUT_SECONDS:
+            break
+        attempted += 1
+        attempt_started = time.monotonic()
+        _REQUEST_INFO.kind = "unknown"
         try:
-            return request_clients5_endpoint(text, sl, tl)
-        except Exception as e2:
-            logHandler.log.debug(f"OmniTranslate: clients5 endpoint failed: {e2}")
-            try:
-                return request_api_endpoint(text, sl, tl, "dict-chrome-ex")
-            except Exception as e3:
-                logHandler.log.debug(f"OmniTranslate: dict-chrome-ex endpoint failed: {e3}")
-                return request_web_fallback(text, sl, tl)
+            res = _call_online_endpoint(name, text, sl, tl, min(_attempt_timeout(base_timeout, text), remaining))
+        except Exception as e:
+            last_err = e
+            if _is_network_unreachable_error(e):
+                _mark_network_down()
+                logHandler.log.debug(f"OmniTranslate: network unreachable via {name}: {e}")
+                raise OnlineUnavailableError(f"Network unreachable: {e}") from e
+            if _is_timeout_error(e):
+                timed_out += 1
+                if is_long_text:
+                    # A slow reply to a long text means a slow connection, not a broken endpoint: do not pause it.
+                    logHandler.log.debug(f"OmniTranslate: {name} endpoint timed out on a {len(text)}-character text; endpoint not paused")
+                    continue
+            cooldown = _record_endpoint_failure(name, e)
+            logHandler.log.debug(f"OmniTranslate: {name} endpoint failed: {e} (cooldown {cooldown:.0f}s)")
+            continue
+        _record_endpoint_success(name)
+        if res and res[0] and res[0].strip():
+            logHandler.log.info(
+                f"OmniTranslate: Online {name}: {len(text)} chars in {(time.monotonic() - attempt_started) * 1000:.0f} ms "
+                f"({getattr(_REQUEST_INFO, 'kind', 'unknown')})"
+            )
+            _put_to_cache(text, sl, tl, res[0], res[1])
+            return res
+        if empty_result is None:
+            empty_result = res
+
+    if empty_result is not None:
+        return empty_result
+    if attempted and timed_out == attempted and not is_long_text:
+        _mark_network_down()
+    raise OnlineUnavailableError(f"All online endpoints failed or are cooling down (last error: {last_err})")
 
 
 def normalize_newlines(text):
@@ -207,6 +735,10 @@ def translate_query(text, sl, tl):
         return "", sl
 
     normalized = normalize_newlines(text)
+    cached = _get_from_cache(normalized, sl, tl)
+    if cached:
+        return cached
+
     if '\n' not in normalized:
         return translate_single_chunk(normalized.strip(), sl, tl)
 
@@ -214,26 +746,55 @@ def translate_query(text, sl, tl):
     try:
         res, det = translate_single_chunk(normalized.strip(), sl, tl)
         if res and res.strip():
+            _put_to_cache(normalized, sl, tl, res, det)
             return res, det
+    except OnlineUnavailableError:
+        raise
     except Exception as ex:
         logHandler.log.debug(f"OmniTranslate: direct multiline chunk translate failed, falling back line-by-line: {ex}")
 
-    # Fallback: line-by-line translation
+    # Fallback: concurrent line-by-line translation to eliminate serial network latency
     lines = normalized.split('\n')
-    translated_lines = []
+    translated_lines = [""] * len(lines)
     overall_detected = sl
 
-    for line in lines:
-        line_str = line.strip()
-        if not line_str:
-            translated_lines.append("")
-            continue
-        res_line, det_line = translate_single_chunk(line_str, sl, tl)
-        if det_line and det_line != "auto" and overall_detected in ("auto", sl):
-            overall_detected = det_line
-        translated_lines.append(res_line)
+    non_empty_items = [(idx, line.strip()) for idx, line in enumerate(lines) if line.strip()]
+    if not non_empty_items:
+        return "\r\n".join(lines), sl
 
-    return "\r\n".join(translated_lines), overall_detected
+    # Single non-empty line optimization (bypasses thread pool overhead)
+    if len(non_empty_items) == 1:
+        idx, line_str = non_empty_items[0]
+        res_line, det_line = translate_single_chunk(line_str, sl, tl)
+        translated_lines[idx] = res_line
+        if det_line and det_line != "auto":
+            overall_detected = det_line
+    else:
+        # Limited concurrency avoids request bursts that trigger Google rate-limiting (HTTP 429 / CAPTCHA)
+        workers = min(len(non_empty_items), MAX_CONCURRENT_LINE_REQUESTS)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+            future_map = {
+                executor.submit(translate_single_chunk, line_str, sl, tl): (idx, line_str)
+                for idx, line_str in non_empty_items
+            }
+            for future in concurrent.futures.as_completed(future_map):
+                idx, line_str = future_map[future]
+                try:
+                    res_line, det_line = future.result()
+                except Exception as err:
+                    # Fail the whole chunk instead of leaving untranslated lines mixed into the result;
+                    # the caller then translates the full chunk offline.
+                    for pending in future_map:
+                        pending.cancel()
+                    logHandler.log.debug(f"OmniTranslate: line translation failed for line {idx}: {err}")
+                    raise OnlineUnavailableError(f"Line {idx} translation failed: {err}") from err
+                translated_lines[idx] = res_line
+                if det_line and det_line != "auto" and overall_detected in ("auto", sl):
+                    overall_detected = det_line
+
+    final_result = "\r\n".join(translated_lines)
+    _put_to_cache(normalized, sl, tl, final_result, overall_detected)
+    return final_result, overall_detected
 
 
 def get_swap_language(primary_target, secondary_lang):
@@ -248,7 +809,113 @@ def get_swap_language(primary_target, secondary_lang):
     return None
 
 
+# Text Layout Preservation (shared by the online and offline engines)
+# Indentation, list markers (bullets, numbering, Markdown headings, quote markers), blank lines and trailing
+# spaces are separated from the translatable content before translation and restored afterwards, so neither
+# Google nor the neural models can drop, renumber or re-indent them. Only content lines are sent, joined by
+# single newlines; if an engine merges or splits lines, the text is re-translated paragraph by paragraph and,
+# if needed, line by line, so the original line structure is always kept.
+_LAYOUT_PREFIX_RE = re.compile(
+    r'^(?P<indent>[ \t\u00a0\u3000]*)'
+    r'(?P<marker>(?:'
+    r'[-*+\u2022\u25e6\u25aa\u25ab\u2023\u2043\u25cf\u25cb\u25a0\u25a1\u25ba\u25b6\u27a2\u2713\u2714\u2610\u2611\u2013\u2014>]'
+    r'|#{1,6}'
+    r'|\(?(?:\d{1,3}|[\u0e50-\u0e59]{1,3}|[A-Za-z]|[ivxlcdmIVXLCDM]{1,6})[.)]'
+    r'|\d{1,3}(?:\.\d{1,3})+\.?'
+    r')[ \t\u00a0]+)?'
+)
+
+
+def _parse_text_layout(text):
+    """Splits text into a layout skeleton and its translatable content lines.
+    Returns (lines, contents): each line is (prefix, content_index or None, suffix); lines without
+    content (blank, whitespace-only, marker-only or symbol-only dividers) keep their raw text in prefix."""
+    lines = []
+    contents = []
+    for raw in normalize_newlines(text).split("\n"):
+        if not raw.strip():
+            lines.append((raw, None, ""))
+            continue
+        match = _LAYOUT_PREFIX_RE.match(raw)
+        prefix = match.group(0) if match else ""
+        rest = raw[len(prefix):]
+        body = rest.rstrip()
+        suffix = rest[len(body):]
+        if not any(ch.isalnum() for ch in body):
+            # Marker-only or symbol-only lines (dividers such as "---", "***", "====") are layout, not content
+            lines.append((raw, None, ""))
+            continue
+        lines.append((prefix, len(contents), suffix))
+        contents.append(body)
+    return lines, contents
+
+
+def _rebuild_text_layout(lines, translations):
+    """Reassembles translated content into the original skeleton using Windows CRLF line breaks."""
+    out = []
+    for prefix, idx, suffix in lines:
+        out.append(prefix if idx is None else prefix + translations[idx] + suffix)
+    return "\r\n".join(out)
+
+
+def _split_translated_lines(translated, expected_count):
+    """Returns the translated lines if the engine kept exactly one non-empty line per content line, else None."""
+    parts = [part.strip() for part in normalize_newlines(translated or "").strip("\n").split("\n")]
+    if len(parts) != expected_count or any(not part for part in parts):
+        return None
+    return parts
+
+
+def _translate_layout_groups(lines, contents, sl, tl):
+    """Fallback when an engine changed the line count: translate each paragraph (run of content lines between
+    blank lines) separately, and line by line only for a paragraph whose line count still does not match."""
+    groups = []
+    current = []
+    for _prefix, idx, _suffix in lines:
+        if idx is None:
+            if current:
+                groups.append(current)
+                current = []
+        else:
+            current.append(idx)
+    if current:
+        groups.append(current)
+
+    translations = [None] * len(contents)
+    for group in groups:
+        if len(group) > 1:
+            group_text, _det, _tgt = _execute_translation_engine("\n".join(contents[i] for i in group), sl, tl)
+            group_lines = _split_translated_lines(group_text, len(group))
+            if group_lines:
+                for i, line in zip(group, group_lines):
+                    translations[i] = line
+                continue
+        for i in group:
+            line_text, _det, _tgt = _execute_translation_engine(contents[i], sl, tl)
+            translations[i] = (line_text or "").strip() or contents[i]
+    return translations
+
+
 def execute_translation(text, sl, tl):
+    """Translates text through the online or offline engine while preserving its layout
+    (paragraphs, blank lines, indentation, list markers and numbering). Returns (text, detected_src, target)."""
+    lines, contents = _parse_text_layout(text)
+    if not contents:
+        return text, sl, tl
+    if len(lines) == 1:
+        prefix, _idx, suffix = lines[0]
+        translated, detected_src, target = _execute_translation_engine(contents[0], sl, tl)
+        return prefix + (translated or "").strip() + suffix, detected_src, target
+
+    translated, detected_src, target = _execute_translation_engine("\n".join(contents), sl, tl)
+    per_line = _split_translated_lines(translated, len(contents))
+    if per_line is None:
+        logHandler.log.debug("OmniTranslate: engine changed the line structure; re-translating by paragraph to preserve layout")
+        per_line = _translate_layout_groups(lines, contents, sl, tl)
+    return _rebuild_text_layout(lines, per_line), detected_src, target
+
+
+def _execute_translation_engine(text, sl, tl):
     cfg = settingsDialogs.load_config()
     mode = cfg.get("translationMode", "online")
     secondary_lang = cfg.get("sourceLang", "en")
@@ -352,6 +1019,8 @@ def execute_translation(text, sl, tl):
         supp_info = offlineEngine.get_model_supported_languages(active_model)
         is_multilingual = supp_info.get("is_multilingual", True)
 
+        _announce_offline_fallback()
+
         try:
             if is_multilingual and is_auto and swap_target:
                 detected_src = offlineEngine.detect_text_language(text, hint_langs=(primary_target, swap_target))
@@ -375,16 +1044,46 @@ def execute_translation(text, sl, tl):
             raise Exception(_("Online translation failed, and offline fallback failed: {err}").format(err=str(offline_err)))
 
 
+class _LegacyIgnoreInjectedKeys:
+    """Fallback for NVDA versions without keyboardHandler.ignoreInjection(): toggles keyboardHandler.ignoreInjected."""
+    def __enter__(self):
+        self._had = hasattr(keyboardHandler, "ignoreInjected")
+        if self._had:
+            self._previous = keyboardHandler.ignoreInjected
+            keyboardHandler.ignoreInjected = True
+        return self
+
+    def __exit__(self, *exc):
+        if self._had:
+            keyboardHandler.ignoreInjected = self._previous
+        return False
+
+
+def _nvda_ignores_injected_keys():
+    """Context in which NVDA ignores the keystrokes OmniTranslate injects (Ctrl+C / Ctrl+V / modifier releases).
+    This is the mechanism NVDA itself uses in KeyboardInputGesture.send(): the keys still reach the application,
+    but NVDA does not treat them as user input, so it does not interrupt speech and other add-ons' Ctrl+C / Ctrl+V
+    scripts (clipboard announcers) are not triggered."""
+    ignore_injection = getattr(keyboardHandler, "ignoreInjection", None)
+    if callable(ignore_injection):
+        try:
+            return ignore_injection()
+        except Exception:
+            pass
+    return _LegacyIgnoreInjectedKeys()
+
+
 def _release_modifiers():
     """Releases physical modifier keys (Shift, Ctrl, Alt, Win) if currently held to prevent keystroke distortion."""
     if is_secure_mode():
         return
     try:
-        user32 = ctypes.windll.user32
+        user32 = _user32
         KEYEVENTF_KEYUP = 0x0002
-        for vk in (0x10, 0xA0, 0xA1, 0x11, 0xA2, 0xA3, 0x12, 0xA4, 0xA5, 0x5B, 0x5C):
-            if user32.GetAsyncKeyState(vk) & 0x8000:
-                user32.keybd_event(vk, 0, KEYEVENTF_KEYUP, 0)
+        with _nvda_ignores_injected_keys():
+            for vk in (0x10, 0xA0, 0xA1, 0x11, 0xA2, 0xA3, 0x12, 0xA4, 0xA5, 0x5B, 0x5C):
+                if user32.GetAsyncKeyState(vk) & 0x8000:
+                    user32.keybd_event(vk, 0, KEYEVENTF_KEYUP, 0)
     except Exception:
         pass
 
@@ -394,7 +1093,7 @@ def _wait_for_modifiers_released(timeout_ms=50):
     if is_secure_mode():
         return
     try:
-        user32 = ctypes.windll.user32
+        user32 = _user32
         vks = (0x10, 0x11, 0x12, 0x5B, 0x5C)
         start = time.time()
         max_duration = timeout_ms / 1000.0
@@ -415,17 +1114,120 @@ def send_copy_message_api(target_hwnd=None):
     if is_secure_mode():
         return False
     try:
-        user32 = ctypes.windll.user32
+        user32 = _user32
         if not target_hwnd:
             target_hwnd = user32.GetForegroundWindow()
         if target_hwnd:
             SMTO_ABORTIFHUNG = 0x0002
-            res = ctypes.c_ulong()
+            res = ctypes.c_size_t()
             user32.SendMessageTimeoutW(target_hwnd, 0x0301, 0, 0, SMTO_ABORTIFHUNG, 60, ctypes.byref(res))
             return True
     except Exception as e:
         logHandler.log.debug(f"OmniTranslate: send_copy_message_api error: {e}")
     return False
+
+
+# Silent Paste for Standard Windows Edit Controls
+# Synthetic Ctrl+V passes through NVDA's keyboard hook: NVDA interrupts speech on the key press and other
+# add-ons bound to Ctrl+V (clipboard announcers) speak over the result. Classic Win32 edit, RichEdit and
+# Scintilla controls process WM_PASTE synchronously, so for them the translation is pasted through the
+# Windows API without any key press. All other controls keep the proven Ctrl+V path.
+_WM_PASTE_SAFE_CLASS_PREFIXES = ("edit", "richedit", "scintilla")
+PASTE_SPEECH_SETTLE_SECONDS = 0.35
+# WM_PASTE is processed on the target application's UI thread, which can be busy for far longer than 60 ms
+# (Explorer's Run dialog, for example). The paste is only considered done when the control has processed it
+# and its text has changed; only then is the user's clipboard restored. Otherwise Ctrl+V is used instead.
+WM_GETTEXT = 0x000D
+WM_GETTEXTLENGTH = 0x000E
+WM_PASTE = 0x0302
+SMTO_ABORTIFHUNG = 0x0002
+ERROR_TIMEOUT = 1460
+WM_PASTE_TIMEOUT_MS = 2000
+WM_PASTE_LATE_WAIT_SECONDS = 1.5
+WM_TEXT_QUERY_TIMEOUT_MS = 500
+WM_PASTE_VERIFY_MAX_CHARS = 2000000
+PASTE_NOT_APPLICABLE = "not-applicable"   # not a standard edit control: use Ctrl+V
+PASTE_DONE = "done"                       # pasted and verified
+PASTE_FAILED = "failed"                   # not delivered or ignored by the control: use Ctrl+V
+PASTE_PENDING = "pending"                 # control did not respond in time; it may still paste later
+
+
+def _send_message_timeout(hwnd, msg, wparam, lparam, timeout_ms):
+    """SendMessageTimeoutW returning (processed, result, last_error)."""
+    result = ctypes.c_size_t(0)
+    try:
+        ctypes.set_last_error(0)
+        ok = _user32.SendMessageTimeoutW(hwnd, msg, wparam, lparam, SMTO_ABORTIFHUNG, timeout_ms, ctypes.byref(result))
+        return bool(ok), result.value, ctypes.get_last_error()
+    except Exception as e:
+        logHandler.log.debug(f"OmniTranslate: SendMessageTimeoutW error: {e}")
+        return False, 0, -1
+
+
+def _read_edit_text(hwnd):
+    """Returns (length, text) of a standard edit control; text is None when too large or unreadable,
+    and length is None when the control does not answer."""
+    ok, length, _err = _send_message_timeout(hwnd, WM_GETTEXTLENGTH, 0, 0, WM_TEXT_QUERY_TIMEOUT_MS)
+    if not ok:
+        return None, None
+    if length > WM_PASTE_VERIFY_MAX_CHARS:
+        return length, None
+    buf = ctypes.create_unicode_buffer(length + 1)
+    ok, _copied, _err = _send_message_timeout(hwnd, WM_GETTEXT, length + 1, ctypes.addressof(buf), WM_TEXT_QUERY_TIMEOUT_MS)
+    return length, (buf.value if ok else None)
+
+
+def _edit_text_changed(hwnd, before_len, before_text):
+    """True if the control's text differs from the snapshot; None if that cannot be determined."""
+    after_len, after_text = _read_edit_text(hwnd)
+    if after_len is None:
+        return None
+    if after_len != before_len:
+        return True
+    if before_text is not None and after_text is not None:
+        return after_text != before_text
+    return None
+
+
+def _get_window_class_name(hwnd):
+    if not hwnd or _user32 is None:
+        return ""
+    try:
+        buf = ctypes.create_unicode_buffer(256)
+        if _user32.GetClassNameW(hwnd, buf, 256):
+            return buf.value or ""
+    except Exception:
+        pass
+    return ""
+
+
+def paste_without_keystroke(target_hwnd):
+    """Pastes the clipboard into a standard Windows edit control with WM_PASTE and verifies the result.
+    Returns PASTE_DONE, PASTE_PENDING, PASTE_FAILED (caller uses Ctrl+V) or PASTE_NOT_APPLICABLE (caller uses Ctrl+V)."""
+    if is_secure_mode() or not target_hwnd:
+        return PASTE_NOT_APPLICABLE
+    class_name = _get_window_class_name(target_hwnd).lower()
+    if not class_name.startswith(_WM_PASTE_SAFE_CLASS_PREFIXES):
+        return PASTE_NOT_APPLICABLE
+    before_len, before_text = _read_edit_text(target_hwnd)
+    if before_len is None:
+        return PASTE_NOT_APPLICABLE  # the control cannot be checked, so the paste could not be verified
+    processed, _result, err = _send_message_timeout(target_hwnd, WM_PASTE, 0, 0, WM_PASTE_TIMEOUT_MS)
+    if processed:
+        if _edit_text_changed(target_hwnd, before_len, before_text) is False:
+            logHandler.log.debug(f"OmniTranslate: {class_name} processed WM_PASTE but its text did not change")
+            return PASTE_FAILED
+        return PASTE_DONE
+    if err != ERROR_TIMEOUT:
+        logHandler.log.debug(f"OmniTranslate: WM_PASTE not delivered to {class_name} (error {err})")
+        return PASTE_FAILED
+    # The message is still queued in the busy application; wait for it instead of pasting twice.
+    deadline = time.monotonic() + WM_PASTE_LATE_WAIT_SECONDS
+    while time.monotonic() < deadline:
+        time.sleep(0.05)
+        if _edit_text_changed(target_hwnd, before_len, before_text):
+            return PASTE_DONE
+    return PASTE_PENDING
 
 
 def send_paste_message_api(target_hwnd=None):
@@ -436,12 +1238,12 @@ def send_paste_message_api(target_hwnd=None):
     if is_secure_mode():
         return False
     try:
-        user32 = ctypes.windll.user32
+        user32 = _user32
         if not target_hwnd:
             target_hwnd = user32.GetForegroundWindow()
         if target_hwnd:
             SMTO_ABORTIFHUNG = 0x0002
-            res = ctypes.c_ulong()
+            res = ctypes.c_size_t()
             user32.SendMessageTimeoutW(target_hwnd, 0x0302, 0, 0, SMTO_ABORTIFHUNG, 60, ctypes.byref(res))
             return True
     except Exception as e:
@@ -459,25 +1261,26 @@ def send_paste_input():
     try:
         _release_modifiers()
 
-        user32 = ctypes.windll.user32
+        user32 = _user32
         VK_CONTROL = 0x11
         VK_V = 0x56
         KEYEVENTF_KEYUP = 0x0002
         scan_ctrl = user32.MapVirtualKeyW(VK_CONTROL, 0)
         scan_v = user32.MapVirtualKeyW(VK_V, 0)
 
-        # 1. Ctrl Down
-        user32.keybd_event(VK_CONTROL, scan_ctrl, 0, 0)
-        time.sleep(0.025)
+        with _nvda_ignores_injected_keys():
+            # 1. Ctrl Down
+            user32.keybd_event(VK_CONTROL, scan_ctrl, 0, 0)
+            time.sleep(0.025)
 
-        # 2. V Down & Up
-        user32.keybd_event(VK_V, scan_v, 0, 0)
-        time.sleep(0.035)
-        user32.keybd_event(VK_V, scan_v, KEYEVENTF_KEYUP, 0)
-        time.sleep(0.025)
+            # 2. V Down & Up
+            user32.keybd_event(VK_V, scan_v, 0, 0)
+            time.sleep(0.035)
+            user32.keybd_event(VK_V, scan_v, KEYEVENTF_KEYUP, 0)
+            time.sleep(0.025)
 
-        # 3. Ctrl Up
-        user32.keybd_event(VK_CONTROL, scan_ctrl, KEYEVENTF_KEYUP, 0)
+            # 3. Ctrl Up
+            user32.keybd_event(VK_CONTROL, scan_ctrl, KEYEVENTF_KEYUP, 0)
     except Exception as e:
         logHandler.log.debug(f"OmniTranslate: send_paste_input error: {e}")
 
@@ -489,25 +1292,26 @@ def send_copy_input():
     try:
         _release_modifiers()
 
-        user32 = ctypes.windll.user32
+        user32 = _user32
         VK_CONTROL = 0x11
         VK_C = 0x43
         KEYEVENTF_KEYUP = 0x0002
         scan_ctrl = user32.MapVirtualKeyW(VK_CONTROL, 0)
         scan_c = user32.MapVirtualKeyW(VK_C, 0)
 
-        # 1. Ctrl Down
-        user32.keybd_event(VK_CONTROL, scan_ctrl, 0, 0)
-        time.sleep(0.025)
+        with _nvda_ignores_injected_keys():
+            # 1. Ctrl Down
+            user32.keybd_event(VK_CONTROL, scan_ctrl, 0, 0)
+            time.sleep(0.025)
 
-        # 2. C Down & Up
-        user32.keybd_event(VK_C, scan_c, 0, 0)
-        time.sleep(0.035)
-        user32.keybd_event(VK_C, scan_c, KEYEVENTF_KEYUP, 0)
-        time.sleep(0.025)
+            # 2. C Down & Up
+            user32.keybd_event(VK_C, scan_c, 0, 0)
+            time.sleep(0.035)
+            user32.keybd_event(VK_C, scan_c, KEYEVENTF_KEYUP, 0)
+            time.sleep(0.025)
 
-        # 3. Ctrl Up
-        user32.keybd_event(VK_CONTROL, scan_ctrl, KEYEVENTF_KEYUP, 0)
+            # 3. Ctrl Up
+            user32.keybd_event(VK_CONTROL, scan_ctrl, KEYEVENTF_KEYUP, 0)
     except Exception as e:
         logHandler.log.debug(f"OmniTranslate: send_copy_input error: {e}")
 
@@ -518,8 +1322,8 @@ def _snapshot_clipboard():
     """
     snapshot = {}
     try:
-        user32 = ctypes.windll.user32
-        kernel32 = ctypes.windll.kernel32
+        user32 = _user32
+        kernel32 = _kernel32
 
         user32.GetClipboardData.restype = ctypes.c_void_p
         user32.GetClipboardData.argtypes = [ctypes.c_uint]
@@ -564,8 +1368,8 @@ def _restore_clipboard(snapshot=None, initial_text=""):
     If snapshot was empty and initial_text was empty, cleanses the clipboard via user32.EmptyClipboard.
     """
     try:
-        user32 = ctypes.windll.user32
-        kernel32 = ctypes.windll.kernel32
+        user32 = _user32
+        kernel32 = _kernel32
 
         user32.SetClipboardData.restype = ctypes.c_void_p
         user32.SetClipboardData.argtypes = [ctypes.c_uint, ctypes.c_void_p]
@@ -634,8 +1438,8 @@ def set_clipboard_text(text):
     if not isinstance(text, str) or not text:
         return False
     try:
-        user32 = ctypes.windll.user32
-        kernel32 = ctypes.windll.kernel32
+        user32 = _user32
+        kernel32 = _kernel32
 
         user32.SetClipboardData.restype = ctypes.c_void_p
         user32.SetClipboardData.argtypes = [ctypes.c_uint, ctypes.c_void_p]
@@ -803,7 +1607,10 @@ def create_translation_chunks(text, max_chunk_size=MAX_CHUNK_CHARS, max_total_li
 
 
 def _is_protected_object(obj):
-    """Checks if an NVDA object or its ancestors represent a protected/password field."""
+    """Checks if an NVDA object or its ancestors represent a protected/password field.
+    Strictly safeguards user credentials while preventing false positives on documents,
+    webpages, manuals, or windows whose titles contain password-related keywords.
+    """
     if not obj:
         return False
     try:
@@ -813,28 +1620,15 @@ def _is_protected_object(obj):
                 break
             states = getattr(curr, "states", set())
             role = getattr(curr, "role", None)
+
+            # 1. Definitive NVDA protected state and password roles
             if controlTypes.State.PROTECTED in states:
                 return True
             pw_role = getattr(controlTypes.Role, "PASSWORDEDIT", None)
             if pw_role is not None and role == pw_role:
                 return True
 
-            # Check accessible name, description, or roleText for password keywords
-            name = (getattr(curr, "name", "") or "").lower()
-            desc = (getattr(curr, "description", "") or "").lower()
-            role_text = (getattr(curr, "roleText", "") or "").lower()
-            pw_keywords = ("password", "passcode", "passwd", "pin code", "รหัสผ่าน", "secret", "pwd")
-            if any(kw in name or kw in desc or kw in role_text for kw in pw_keywords):
-                if _is_editable_object(curr) or role in (
-                    getattr(controlTypes.Role, "EDITABLETEXT", None),
-                    getattr(controlTypes.Role, "PASSWORDEDIT", None),
-                    getattr(controlTypes.Role, "DOCUMENT", None),
-                    getattr(controlTypes.Role, "TEXTFRAME", None),
-                    getattr(controlTypes.Role, "WINDOW", None),
-                ):
-                    return True
-
-            # Direct UIA IsPassword property check (30019 = UIA_IsPasswordPropertyId)
+            # 2. Direct UIA IsPassword property check (30019 = UIA_IsPasswordPropertyId)
             try:
                 uia_elem = getattr(curr, "UIAElement", None)
                 if uia_elem and uia_elem.GetCurrentPropertyValue(30019):
@@ -842,11 +1636,12 @@ def _is_protected_object(obj):
             except Exception:
                 pass
 
-            # Win32 ES_PASSWORD or EM_GETPASSWORDCHAR check
+            # 3. Win32 ES_PASSWORD or EM_GETPASSWORDCHAR check (applicable strictly to Edit controls)
             hwnd = getattr(curr, "windowHandle", None)
-            if hwnd:
+            win_class = (getattr(curr, "windowClassName", "") or "").lower()
+            if hwnd and ("edit" in win_class or role == getattr(controlTypes.Role, "EDITABLETEXT", None)):
                 try:
-                    user32 = ctypes.windll.user32
+                    user32 = _user32
                     style = user32.GetWindowLongW(hwnd, -16)
                     if style & 0x0020:  # ES_PASSWORD
                         return True
@@ -854,6 +1649,22 @@ def _is_protected_object(obj):
                         return True
                 except Exception:
                     pass
+
+            # 4. Fallback keyword heuristic for poorly-accessible custom single-line password inputs.
+            # Strictly restricted to single-line editable text fields at the focused level or immediate edit ancestor.
+            # Never flag documents, windows, text frames, or multiline editors (e.g. Word documents or manuals).
+            is_single_line_edit = (
+                role == getattr(controlTypes.Role, "EDITABLETEXT", None)
+                and controlTypes.State.MULTILINE not in states
+                and controlTypes.State.READONLY not in states
+            )
+            if is_single_line_edit:
+                name = (getattr(curr, "name", "") or "").lower()
+                desc = (getattr(curr, "description", "") or "").lower()
+                role_text = (getattr(curr, "roleText", "") or "").lower()
+                pw_keywords = ("password", "passcode", "passwd", "pin code", "รหัสผ่าน")
+                if any(kw in name or kw in desc or kw in role_text for kw in pw_keywords):
+                    return True
 
             curr = getattr(curr, "parent", None)
     except Exception as e:
@@ -952,11 +1763,54 @@ def _is_copy_probe_allowed(obj):
         return False
 
 
+_SECRET_PREFIX_RE = re.compile(
+    r'^(sk-|sk_live_|sk_test_|pk_live_|rk_live_|ghp_|gho_|ghu_|ghs_|ghr_|github_pat_|glpat-|xox[abprs]-|'
+    r'AKIA|ASIA|AIza|ya29\.|hf_|npm_|pypi-|SG\.|EAA[A-Za-z0-9])'
+)
+_JWT_RE = re.compile(r'^eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}$')
+_OTP_RE = re.compile(r'^\d{4,8}$')
+_NON_SECRET_TOKEN_RE = re.compile(r'^(https?://|www\.|[A-Za-z]:\\|\\\\|/)|^[^@\s]+@[^@\s]+\.[A-Za-z]{2,}$')
+_LONG_TOKEN_RE = re.compile(r'^[A-Za-z0-9+/=_-]{32,}$')
+
+
+def _looks_like_secret(text):
+    """Heuristic for clipboard content that must never be sent to an online translation service:
+    private keys, API keys/tokens with well-known prefixes, JWTs, one-time codes, and single
+    whitespace-free tokens that mix character classes the way generated passwords do.
+    Natural-language text (anything with spaces, or non-ASCII scripts such as Thai) is never matched."""
+    if not text or not isinstance(text, str):
+        return False
+    s = text.strip()
+    if not s:
+        return False
+    if "-----BEGIN" in s and "PRIVATE KEY-----" in s:
+        return True
+    if len(s) > 4096 or any(ch.isspace() for ch in s) or not s.isascii():
+        return False
+    if len(s) >= 16 and _SECRET_PREFIX_RE.match(s):
+        return True
+    if _JWT_RE.match(s) or _OTP_RE.match(s):
+        return True
+    if _NON_SECRET_TOKEN_RE.match(s):
+        return False
+    if len(s) < 8 or len(s) > 256:
+        return False
+    classes = sum((
+        any(ch.islower() for ch in s),
+        any(ch.isupper() for ch in s),
+        any(ch.isdigit() for ch in s),
+        any(not ch.isalnum() for ch in s),
+    ))
+    if classes >= 4 or (classes == 3 and len(s) >= 16):
+        return True
+    return classes >= 2 and any(ch.isdigit() for ch in s) and bool(_LONG_TOKEN_RE.match(s))
+
+
 def _is_clipboard_sensitive():
     """Checks if the system clipboard was populated by a password manager or marked sensitive."""
     try:
-        user32 = ctypes.windll.user32
-        kernel32 = ctypes.windll.kernel32
+        user32 = _user32
+        kernel32 = _kernel32
 
         user32.GetClipboardData.restype = ctypes.c_void_p
         user32.GetClipboardData.argtypes = [ctypes.c_uint]
@@ -1052,7 +1906,7 @@ def _is_editable_object(obj):
             hwnd = getattr(obj, "windowHandle", None)
             if hwnd:
                 try:
-                    user32 = ctypes.windll.user32
+                    user32 = _user32
                     GWL_STYLE = -16
                     ES_READONLY = 0x0800
                     style = user32.GetWindowLongW(hwnd, GWL_STYLE)
@@ -1117,11 +1971,28 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 
     def __init__(self):
         super(GlobalPlugin, self).__init__()
+        self._in_layer = False
+        self._layer_timer = None
+        self._job_gen = 0
+        self._job_gen_lock = threading.Lock()
+        self._job_lock = threading.Lock()
+        if is_secure_mode():
+            # Secure screens (sign-in, lock screen, UAC): bind no gestures, add no settings panels and
+            # start no network services. OmniTranslate stays completely inert there.
+            try:
+                self.clearGestureBindings()
+            except Exception:
+                pass
+            return
         NVDASettingsDialog.categoryClasses.append(settingsDialogs.OmniTranslateGeneralSettingsPanel)
         NVDASettingsDialog.categoryClasses.append(settingsDialogs.OmniTranslateOfflineModelsPanel)
         self.current_slot_index = 0
         self._in_layer = False
         self._layer_timer = None
+        self._layer_entry_time = 0.0
+        self._last_layer_exit_time = 0.0
+        self._last_layer_exit_vk = None
+        self._last_layer_exit_ident = ""
         self._last_translate_time = 0.0
         cfg = settingsDialogs.load_config()
         if cfg.get("translationMode", "online") == "online":
@@ -1137,6 +2008,11 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         try:
             offlineEngine.cancel_online_idle_timer()
             offlineEngine.unload_all_models()
+            offlineEngine.clear_offline_cache()
+            with _CACHE_LOCK:
+                _TRANSLATION_CACHE.clear()
+            reset_online_health()
+            close_online_connections()
         except Exception as e:
             logHandler.log.debug(f"OmniTranslate: Error unloading models on terminate: {e}")
         try:
@@ -1173,6 +2049,18 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 
     def getScript(self, gesture):
         if not getattr(self, "_in_layer", False):
+            # Suppress trailing key repeat / debounce bounce immediately following layer command execution
+            vk = getattr(gesture, "vkCode", None)
+            idents = [i.lower() for i in getattr(gesture, "identifiers", [])]
+            first_ident = idents[0] if idents else ""
+            if (
+                (
+                    (vk is not None and vk == getattr(self, "_last_layer_exit_vk", None))
+                    or (first_ident and first_ident == getattr(self, "_last_layer_exit_ident", ""))
+                )
+                and (time.time() - getattr(self, "_last_layer_exit_time", 0.0) < 0.35)
+            ):
+                return lambda g: None
             return super(GlobalPlugin, self).getScript(gesture)
 
         # In layer mode:
@@ -1188,6 +2076,11 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             getattr(gesture, "isShift", False)
             or any("shift" in ident for ident in idents)
         )
+
+        # Allow standard Windows task switching (Alt+Tab) to pass through without being trapped
+        if any("alt" in ident for ident in idents) and (vk == 0x09 or any("tab" in ident for ident in idents)):
+            self._exitLayer()
+            return super(GlobalPlugin, self).getScript(gesture)
 
         # Check if user pressed the layer gesture again (dynamic routing, universal signal: NVDA+Shift+VK_T, or string identifier)
         is_layer_repeat = False
@@ -1214,7 +2107,17 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             self._start_layer_timer()
             return lambda g: None
 
-        # User pressed a key in layer mode: exit layer mode
+        # Ignore lingering release artifacts or key-repeats of the trigger key (T) from the opening chord
+        if vk == 0x54 and (time.time() - getattr(self, "_layer_entry_time", 0.0) < 0.25):
+            if is_nvda or is_shift:
+                tones.beep(500, 35)
+                self._start_layer_timer()
+                return lambda g: None
+
+        # User pressed a key in layer mode: exit layer mode and record exit key signal for debounce
+        self._last_layer_exit_time = time.time()
+        self._last_layer_exit_vk = vk
+        self._last_layer_exit_ident = idents[0] if idents else ""
         self._exitLayer()
 
         # Check Escape key -> cancel layer mode with tone (universal VK_ESCAPE = 0x1B)
@@ -1325,8 +2228,10 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             elif key in ("f1", "shift+f1") or key.endswith("+f1"):
                 return self.script_openDoc
 
+        # Unrecognized / unmapped key in layer: play error tone, exit layer, and consume gesture
+        # to strictly prevent any keystrokes from leaking into underlying applications
         tones.beep(250, 25)
-        return super(GlobalPlugin, self).getScript(gesture)
+        return lambda g: None
 
 
     def get_selected_text_info(self):
@@ -1399,7 +2304,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             is_editable = _is_editable_object(focus)
 
         # Record target window handle for direct API messaging (WM_COPY / WM_PASTE)
-        target_hwnd = getattr(focus, "windowHandle", None) or ctypes.windll.user32.GetForegroundWindow()
+        target_hwnd = getattr(focus, "windowHandle", None) or _user32.GetForegroundWindow()
         self._target_hwnd = target_hwnd
 
         # Smart fallback replacement guard for inaccessible controls / games / custom UI (e.g. MW SunAwtFrame)
@@ -1424,10 +2329,81 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         is_readonly = (controlTypes.State.READONLY in states) or is_real_menu or (role in non_input_roles and not is_editable)
         self._can_probe_replace = not is_console and not in_browse_mode and not is_readonly and not _is_protected_object(focus)
         self._can_copy_probe = _is_copy_probe_allowed(focus)
+        # Diagnostic context for the "Text source" log line (no text content is recorded)
+        self._capture_diag = (
+            f"app: {getattr(getattr(focus, 'appModule', None), 'appName', '?')}, window class: {win_class or '?'}, "
+            f"role: {getattr(role, 'name', role)}, editable: {is_editable}, browse mode: {in_browse_mode}, "
+            f"probe allowed: {self._can_copy_probe}, probed replace allowed: {self._can_probe_replace}"
+        )
 
         return text, is_editable, is_from_selection, is_console
 
-    def _async_translate(self, text, sl, tl, is_editable=False, is_from_selection=False, is_console=False, slot_prefix=None):
+    def _async_translate(self, *args, **kwargs):
+        """Runs one translation job at a time. A newer request supersedes the running job, which stops at its
+        next chunk boundary (restoring the clipboard) before the new job starts, so two jobs never run neural
+        inference or touch the clipboard simultaneously."""
+        with self._job_gen_lock:
+            self._job_gen += 1
+            job_id = self._job_gen
+        with self._job_lock:
+            if self._is_job_superseded(job_id):
+                return
+            self._run_translation_job(*args, job_id=job_id, **kwargs)
+
+    def _is_job_superseded(self, job_id):
+        if job_id is None:
+            return False
+        with self._job_gen_lock:
+            return job_id != self._job_gen
+
+    def _translate_chunks(self, chunks, sl, tl, job_id, parallel=1):
+        """Translates document chunks and returns one (text, detected_src, target) per chunk, in order
+        (target None for whitespace-only chunks). The first chunk decides the target language for the whole
+        document; the remaining chunks then run up to `parallel` at a time (online mode), or one by one."""
+        results = [(None, None, None)] * len(chunks)
+        work = [idx for idx, (content, _delim) in enumerate(chunks) if content.strip()]
+        if not work:
+            return results
+        self._raise_if_superseded(job_id)
+        first = work[0]
+        results[first] = execute_translation(chunks[first][0], sl, tl)
+        doc_target = results[first][2]
+        rest = work[1:]
+
+        def _translate_one(idx):
+            self._raise_if_superseded(job_id)
+            return execute_translation(chunks[idx][0], sl, doc_target)
+
+        if parallel <= 1 or len(rest) <= 1:
+            for idx in rest:
+                results[idx] = _translate_one(idx)
+            return results
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(parallel, len(rest))) as executor:
+            futures = {executor.submit(_translate_one, idx): idx for idx in rest}
+            try:
+                for future in concurrent.futures.as_completed(futures):
+                    results[futures[future]] = future.result()
+            except BaseException:
+                for pending in futures:
+                    pending.cancel()
+                raise
+        return results
+
+    def _announce_after_replace(self, spoken_result, slot_prefix=None):
+        """Speaks the translation after an in-place replacement has settled. The quick slot and language were
+        already announced when the translation started ("Slot N (Language): Translating..."); because injected
+        Ctrl+C / Ctrl+V no longer interrupt NVDA speech, that announcement is heard in full and the translation
+        follows it on its own."""
+        time.sleep(PASTE_SPEECH_SETTLE_SECONDS)
+        wx.CallAfter(ui.message, spoken_result)
+
+    def _raise_if_superseded(self, job_id):
+        if self._is_job_superseded(job_id):
+            raise _TranslationSuperseded()
+
+    def _run_translation_job(self, text, sl, tl, is_editable=False, is_from_selection=False, is_console=False, slot_prefix=None, job_id=None):
+        job_started = time.monotonic()
         copied_for_translation = False
         probe_performed = False
         clip_snapshot = None
@@ -1446,6 +2422,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             if not is_secure_mode() and not _is_clipboard_sensitive():
                 clip_snapshot = _snapshot_clipboard()
 
+            capture_source = "accessible selection" if text else ("copy probe not allowed here" if not getattr(self, "_can_copy_probe", False) else "copy probe")
             # 1. Safe Copy Probe for games, web chat boxes, and inaccessible custom UI
             # Suppressed on Windows Desktop, File Explorer, Taskbar, and non-text UI to prevent unwanted copy actions
             if not text and getattr(self, "_can_copy_probe", False):
@@ -1453,7 +2430,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
                 if not is_console and not is_secure_mode() and not _is_clipboard_sensitive():
                     probed_clip = ""
                     clip_cleared = False
-                    user32 = ctypes.windll.user32
+                    user32 = _user32
                     initial_seq = 0
                     try:
                         initial_seq = user32.GetClipboardSequenceNumber()
@@ -1486,12 +2463,14 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
                                     cur = api.getClipData() or ""
                                     if cur and cur.strip():
                                         probed_clip = cur
+                                        capture_source = "copy probe (WM_COPY)"
                                         break
                                 except Exception:
                                     pass
 
                         # Phase 2: If API WM_COPY was not handled by the target window, fall back to keyboard simulation
                         if not probed_clip:
+                            capture_source = "copy probe (Ctrl+C)"
                             _wait_for_modifiers_released(30)
                             send_copy_input()
 
@@ -1533,11 +2512,15 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
                             is_from_selection = True
                             copied_for_translation = True
                         else:
+                            capture_source = f"copy probe captured nothing (clipboard cleared: {clip_cleared}, sequence changed: {bool(initial_seq) and user32.GetClipboardSequenceNumber() != initial_seq})"
                             # If copy probe did not capture any selection, restore original clipboard content immediately
                             _restore_clipboard(clip_snapshot, initial_clip)
                     except Exception as probe_err:
+                        capture_source = f"copy probe failed with an error: {probe_err!r}"
                         logHandler.log.debug(f"OmniTranslate: Copy probe error: {probe_err}")
                         _restore_clipboard(clip_snapshot, initial_clip)
+                else:
+                    capture_source = "copy probe skipped (terminal, secure screen or sensitive clipboard)"
 
             # 2. Fallback to clipboard if text is still empty (copy probe skipped or captured nothing)
             if not text:
@@ -1546,9 +2529,17 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
                     wx.CallAfter(ui.message, _("Clipboard contains password manager content; translation skipped for security."))
                     return
                 if cfg.get("translateClipboard", True) and initial_clip and initial_clip.strip():
+                    if _looks_like_secret(initial_clip):
+                        if probe_performed:
+                            _restore_clipboard(clip_snapshot, initial_clip)
+                        wx.CallAfter(tones.beep, 200, 70)
+                        wx.CallAfter(ui.message, _("Clipboard looks like a password, key or code; translation skipped for security. Select the text to translate it."))
+                        return
                     text = initial_clip.strip()
                     is_editable = False
                     is_from_selection = False
+                    capture_source += " -> clipboard fallback"
+            logHandler.log.info(f"OmniTranslate: Text source: {capture_source} [{getattr(self, '_capture_diag', '')}]")
 
             # 3. If still no text found to translate, notify and exit
             if not text:
@@ -1604,28 +2595,25 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 
             wx.CallAfter(_announce_start)
 
-            translated_pieces = []
             actual_src = sl
             actual_tgt = tl
             actual_mode = cfg.get("translationMode", "online")
-            doc_target = tl
-            target_decided = False
+            parallel = MAX_PARALLEL_CHUNKS if actual_mode == "online" else 1
+            chunk_results = self._translate_chunks(chunks, sl, tl, job_id, parallel)
 
-            for part_idx, (chunk_content, chunk_delim) in enumerate(chunks):
-                if not chunk_content.strip():
+            translated_pieces = []
+            for (chunk_content, chunk_delim), (part_result, p_src, p_tgt) in zip(chunks, chunk_results):
+                if p_tgt is None:
                     translated_pieces.append(chunk_content + chunk_delim)
                     continue
-                part_result, p_src, p_tgt = execute_translation(chunk_content, sl, doc_target)
-                if not target_decided:
-                    doc_target = p_tgt
-                    target_decided = True
                 actual_src = p_src
                 actual_tgt = p_tgt
                 if p_src in ("offline", "offline-fallback"):
                     actual_mode = p_src
                 translated_pieces.append(part_result + chunk_delim)
 
-            result = "".join(translated_pieces)
+            result = normalize_newlines("".join(translated_pieces)).replace("\n", "\r\n")
+            self._raise_if_superseded(job_id)
             if not result or not result.strip():
                 if copied_for_translation or probe_performed:
                     _restore_clipboard(clip_snapshot, initial_clip)
@@ -1640,7 +2628,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
                 "to": actual_tgt
             })
             settingsDialogs.SESSION_HISTORY = settingsDialogs.SESSION_HISTORY[:10]
-            logHandler.log.info(f"OmniTranslate: Translation successful [Mode: {actual_mode}, Target: {actual_tgt}, Input: {len(text)} chars, Output: {len(result)} chars]")
+            logHandler.log.info(f"OmniTranslate: Translation successful [Mode: {actual_mode}, Target: {actual_tgt}, Input: {len(text)} chars, Output: {len(result)} chars, Time: {(time.monotonic() - job_started) * 1000:.0f} ms]")
 
             spoken_result = result
 
@@ -1672,27 +2660,35 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 
                     # CRITICAL SAFETY GUARD: Only paste if clipboard is verified to contain the translation!
                     # Never paste if clipboard sync failed, preventing accidental overwrites with untranslated or stale text.
+                    paste_state = None
                     if clip_ok:
                         try:
-                            send_paste_input()
+                            paste_state = paste_without_keystroke(getattr(self, "_target_hwnd", None))
+                            if paste_state in (PASTE_NOT_APPLICABLE, PASTE_FAILED):
+                                send_paste_input()
                         finally:
                             time.sleep(0.08)
+                        logHandler.log.info(f"OmniTranslate: Replacement paste method: {'Ctrl+V' if paste_state in (PASTE_NOT_APPLICABLE, PASTE_FAILED) else 'WM_PASTE ' + paste_state}")
                     else:
                         logHandler.log.warning("OmniTranslate: Clipboard sync failed during text replacement; paste aborted for safety.")
 
                     # Clipboard restoration policy: If copyToClipboard is disabled, restore the user's original clipboard
                     # so that temporary paste buffer usage does not overwrite user's clipboard contents.
-                    if not cfg.get("copyToClipboard", False):
+                    # When the application has not processed the paste yet, the translation stays on the clipboard:
+                    # restoring now would make the late paste insert the old clipboard content instead.
+                    if not cfg.get("copyToClipboard", False) and paste_state != PASTE_PENDING:
                         _restore_clipboard(clip_snapshot, initial_clip)
 
                     if cfg.get("speakResult", True):
-                        wx.CallAfter(ui.message, spoken_result)
+                        self._announce_after_replace(spoken_result, slot_prefix)
+                    if paste_state == PASTE_PENDING:
+                        wx.CallAfter(ui.message, _("The application did not respond in time. The translation is on the clipboard; press Control+V to paste it."))
                 except Exception as e:
                     logHandler.log.debug(f"OmniTranslate: Paste replacement error: {e}")
                     if not cfg.get("copyToClipboard", False):
                         _restore_clipboard(clip_snapshot, initial_clip)
                     if cfg.get("speakResult", True):
-                        wx.CallAfter(ui.message, spoken_result)
+                        self._announce_after_replace(spoken_result, slot_prefix)
 
             else:
                 # 2. Automatically Copy to Clipboard (if not replaced)
@@ -1709,6 +2705,10 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
                 # 3. Speech Output (when not replacing)
                 if cfg.get("speakResult", True):
                     wx.CallAfter(ui.message, spoken_result)
+        except _TranslationSuperseded:
+            if not cfg.get("copyToClipboard", False) or copied_for_translation or probe_performed:
+                _restore_clipboard(clip_snapshot, initial_clip)
+            logHandler.log.debug("OmniTranslate: Translation superseded by a newer request; result discarded.")
         except Exception as e:
             if not cfg.get("copyToClipboard", False) or copied_for_translation or probe_performed:
                 _restore_clipboard(clip_snapshot, initial_clip)
@@ -1749,6 +2749,8 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         new_mode = "offline" if cur_mode == "online" else "online"
         settingsDialogs.save_config({"translationMode": new_mode})
         offlineEngine.on_mode_changed(new_mode)
+        if new_mode == "online":
+            reset_online_health()
         if new_mode == "offline":
             tones.beep(400, 40)
             ui.message(_("Translation mode: Offline Only (Local Neural Engine)"))
@@ -1989,6 +2991,12 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
     def script_layer(self, gesture):
         """OmniTranslate Layer: press once then press a sub-key to execute commands."""
         tones.beep(500, 35)
+        try:
+            if settingsDialogs.load_config().get("translationMode", "online") == "online":
+                warm_up_online_connection()
+        except Exception as e:
+            logHandler.log.debug(f"OmniTranslate: warm-up not started: {e}")
         self._exitLayer()
         self._in_layer = True
+        self._layer_entry_time = time.time()
         self._start_layer_timer()
